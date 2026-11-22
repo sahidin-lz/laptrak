@@ -95,34 +95,23 @@ export function handleFirestoreError(
   return errInfo;
 }
 
-// Validate connection to Firestore on startup as required by SDK guidelines
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-    }
-    // Skip logging other errors, as this is simply a connection test.
-  }
-}
-testConnection();
-
 // ============================================================================
 // QUOTA-SAVING FIREBASE SYNC ENGINE ("HEMAT KUOTA HARIAN FIREBASE")
 // ============================================================================
-// Instead of reading/writing ratusan dokumen terpisah setiap kali buka halaman
-// atau upload CSV, seluruh state sekolah dikonsolidasikan ke 1 dokumen bundle
-// (/kiosk_bundles/main) dengan Write-Through Debouncing & Local Cache.
-// - 1x Load Awal = Hanya 1 Read Firestore (menghemat ratusan read)
-// - Bulk CSV 200 baris = Hanya 1 Write Firestore (menghemat 200+ write)
+// Seluruh state sekolah dikonsolidasikan ke 1 dokumen bundle (/kiosk_bundles/main)
+// dengan Content-Fingerprint Deduplication, Write-Through Debouncing, dan Local Cache:
+// - 1x Load Awal = Hanya 1 Read Firestore
+// - Listener Real-time = Hanya 1 Dokumen (/kiosk_bundles/main) untuk seluruh perangkat
+// - Deduplikasi Fingerprint = Perubahan yang sama / perpindahan tab tidak memakan Write
+// - Flush otomatis saat tab ditutup / berpindah (`visibilitychange` & `pagehide`)
 // ============================================================================
 
 const BUNDLE_COLLECTION = 'kiosk_bundles';
 const MAIN_BUNDLE_ID = 'main';
-const AUDIT_COLLECTION = 'transaction_audits';
 const LOCAL_CACHE_KEY = 'laptrack_firebase_quota_cache_v1';
 const KIOSK_SYNC_OWNER_ID = 'laptrack-kiosk-sync-v1';
+
+export type CloudLoadStatus = 'found' | 'not_found' | 'error';
 
 export interface FirebaseQuotaTelemetry {
   projectId: string;
@@ -169,9 +158,43 @@ export function subscribeFirebaseTelemetry(cb: TelemetryListener): () => void {
 }
 
 let bundleExistsOnServer = false;
-let lastWrittenHash = '';
+let cloudLoadStatus: CloudLoadStatus = 'error';
+let lastSyncedFingerprint = '';
+let lastRawPayloadJson = '';
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingStateForSync: AppStatePayload | null = null;
+let flushInFlightPromise: Promise<boolean> | null = null;
+
+export function getLastCloudLoadStatus(): CloudLoadStatus {
+  return cloudLoadStatus;
+}
+
+/**
+ * Computes a deterministic content fingerprint of the core school data
+ * (excluding volatile `updatedAtMs` and UI-only `activePage` / typing drafts)
+ * so that identical data states never consume Firestore write quota.
+ */
+export function computeContentFingerprint(state: Partial<AppStatePayload> | null | undefined): string {
+  if (!state) return '';
+  return JSON.stringify({
+    students: state.students || [],
+    laptops: state.laptops || [],
+    staff: state.staff || [],
+    schedules: state.schedules || [],
+    dailySessions: state.dailySessions || [],
+    transactions: state.transactions || [],
+    printSettings: state.printSettings || null,
+    kioskShared: state.kioskState
+      ? {
+          piketTicket: state.kioskState.piketTicket || null,
+          selectedWilayah: state.kioskState.selectedWilayah || 'putra',
+          scanMode: state.kioskState.scanMode || 'harian',
+          selectedSessionKey: state.kioskState.selectedSessionKey || 'siang',
+          wizardStep: state.kioskState.wizardStep || 'piket_login',
+        }
+      : null,
+  });
+}
 
 // Track Firebase Auth user state without extra Firestore reads
 onAuthStateChanged(auth, (fbUser: FirebaseUser | null) => {
@@ -179,7 +202,7 @@ onAuthStateChanged(auth, (fbUser: FirebaseUser | null) => {
     ...telemetry,
     firebaseUserEmail: fbUser?.email || null,
     firebaseUserUid: fbUser?.uid || null,
-    syncStatus: fbUser ? 'idle' : 'local_cache',
+    syncStatus: fbUser ? 'idle' : telemetry.syncStatus,
   };
   notifyListeners();
 });
@@ -195,7 +218,7 @@ export function saveStateToLocalQuotaCache(state: AppStatePayload): void {
       transactions: state.transactions,
       printSettings: state.printSettings,
       kioskState: state.kioskState,
-      updatedAtMs: state.updatedAtMs || Date.now(),
+      updatedAtMs: typeof state.updatedAtMs === 'number' ? state.updatedAtMs : Date.now(),
       cachedAt: new Date().toISOString(),
     });
     localStorage.setItem(LOCAL_CACHE_KEY, compact);
@@ -220,7 +243,7 @@ export function loadStateFromLocalQuotaCache(): Partial<AppStatePayload> | null 
 
 /**
  * Loads the consolidated school dataset from `/kiosk_bundles/main` using 1 Firestore Read.
- * Always queries Firestore directly so Laptop & HP stay synchronized on Vercel even without Google OAuth popup.
+ * Records whether the cloud document was found, genuinely absent, or unreachable due to network error.
  */
 export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePayload> | null> {
   const localCached = loadStateFromLocalQuotaCache();
@@ -236,12 +259,15 @@ export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePay
 
     if (snap.exists()) {
       bundleExistsOnServer = true;
+      cloudLoadStatus = 'found';
       const data = snap.data();
       const rawJson = typeof data.payloadJson === 'string' ? data.payloadJson : '';
       const version = typeof data.version === 'number' ? data.version : 1;
       if (rawJson) {
-        lastWrittenHash = rawJson;
+        lastRawPayloadJson = rawJson;
         const parsed = JSON.parse(rawJson) as Partial<AppStatePayload>;
+        lastSyncedFingerprint = computeContentFingerprint(parsed);
+
         const estimatedIndividualReadsSaved =
           (parsed.students?.length || 0) +
           (parsed.laptops?.length || 0) +
@@ -263,6 +289,8 @@ export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePay
         notifyListeners();
         return parsed;
       }
+    } else {
+      cloudLoadStatus = 'not_found';
     }
 
     telemetry = {
@@ -272,6 +300,7 @@ export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePay
     notifyListeners();
     return localCached;
   } catch (err) {
+    cloudLoadStatus = 'error';
     const info = handleFirestoreError(err, OperationType.GET, bundlePath);
     telemetry = {
       ...telemetry,
@@ -285,7 +314,7 @@ export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePay
 
 /**
  * Subscribes to real-time changes on the single consolidated document `/kiosk_bundles/main`
- * so when the Admin uploads 106 laptops on the Laptop, the HP receives them live (and vice-versa).
+ * so when the Admin or Guru Piket updates data on Laptop or HP, all other devices receive it live.
  */
 export function subscribeToCloudKioskBundle(
   onRemoteBundle: (bundle: Partial<AppStatePayload>) => void
@@ -298,17 +327,31 @@ export function subscribeToCloudKioskBundle(
     (snap) => {
       if (!snap.exists()) return;
       bundleExistsOnServer = true;
+      cloudLoadStatus = 'found';
       const data = snap.data();
       const rawJson = typeof data.payloadJson === 'string' ? data.payloadJson : '';
       const version = typeof data.version === 'number' ? data.version : 1;
-      if (!rawJson || rawJson === lastWrittenHash) return;
+      if (!rawJson || rawJson === lastRawPayloadJson) return;
 
       try {
-        lastWrittenHash = rawJson;
         const parsed = JSON.parse(rawJson) as Partial<AppStatePayload>;
+        const incomingFingerprint = computeContentFingerprint(parsed);
+
+        lastRawPayloadJson = rawJson;
+        if (incomingFingerprint === lastSyncedFingerprint) {
+          telemetry = {
+            ...telemetry,
+            bundleVersion: Math.max(telemetry.bundleVersion, version),
+            syncStatus: 'synced',
+          };
+          notifyListeners();
+          return;
+        }
+
+        lastSyncedFingerprint = incomingFingerprint;
         telemetry = {
           ...telemetry,
-          bundleVersion: version,
+          bundleVersion: Math.max(telemetry.bundleVersion, version),
           lastSyncedAt: new Date().toLocaleTimeString('id-ID', {
             hour: '2-digit',
             minute: '2-digit',
@@ -331,7 +374,7 @@ export function subscribeToCloudKioskBundle(
 
 /**
  * Flushes the pending state bundle to `/kiosk_bundles/main` in a single Firestore write.
- * Enforces all schema and security rule invariants defined in `firestore.rules`.
+ * Uses content fingerprinting so unchanged data consumes 0 Firestore writes.
  */
 export async function flushStateToFirestoreNow(
   stateOverride?: AppStatePayload
@@ -343,140 +386,180 @@ export async function flushStateToFirestoreNow(
 
   const targetState = stateOverride || pendingStateForSync;
   if (!targetState) return false;
+  pendingStateForSync = null;
 
   // Always update local cache immediately (0 Firestore quota used)
   saveStateToLocalQuotaCache(targetState);
 
-  const estimatedDocsInBundle =
-    targetState.students.length +
-    targetState.laptops.length +
-    targetState.transactions.length +
-    targetState.schedules.length;
+  const nextFingerprint = computeContentFingerprint(targetState);
 
-  const serializable = {
-    students: targetState.students,
-    laptops: targetState.laptops,
-    staff: targetState.staff,
-    schedules: targetState.schedules,
-    dailySessions: targetState.dailySessions,
-    transactions: targetState.transactions,
-    printSettings: targetState.printSettings,
-    kioskState: targetState.kioskState,
-    updatedAtMs: targetState.updatedAtMs || Date.now(),
+  // Deduplicate identical data states to save daily write quota
+  if (nextFingerprint && nextFingerprint === lastSyncedFingerprint && bundleExistsOnServer) {
+    telemetry = {
+      ...telemetry,
+      savedOperations: telemetry.savedOperations + 1,
+      syncStatus: 'synced',
+    };
+    notifyListeners();
+    return true;
+  }
+
+  if (flushInFlightPromise) {
+    pendingStateForSync = targetState;
+    return flushInFlightPromise;
+  }
+
+  const executeFlush = async (): Promise<boolean> => {
+    const estimatedDocsInBundle =
+      targetState.students.length +
+      targetState.laptops.length +
+      targetState.transactions.length +
+      targetState.schedules.length;
+
+    const serializable = {
+      students: targetState.students,
+      laptops: targetState.laptops,
+      staff: targetState.staff,
+      schedules: targetState.schedules,
+      dailySessions: targetState.dailySessions,
+      transactions: targetState.transactions,
+      printSettings: targetState.printSettings,
+      kioskState: targetState.kioskState,
+      updatedAtMs:
+        typeof targetState.updatedAtMs === 'number' && targetState.updatedAtMs > 0
+          ? targetState.updatedAtMs
+          : Date.now(),
+    };
+
+    const payloadJson = JSON.stringify(serializable);
+
+    // Guard against 1MB Firestore document limit (rule cap: 900,000 chars)
+    const boundedPayloadJson =
+      payloadJson.length <= 900000
+        ? payloadJson
+        : JSON.stringify({
+            ...serializable,
+            // Strip large base64 photos if bundle exceeds 900KB
+            students: targetState.students.map((s) => ({ ...s, photo_url: null })),
+          });
+
+    const bundleRef = doc(db, BUNDLE_COLLECTION, MAIN_BUNDLE_ID);
+    const bundlePath = `${BUNDLE_COLLECTION}/${MAIN_BUNDLE_ID}`;
+    const schoolName = (
+      targetState.printSettings?.schoolName || 'SMA NEGERI 1 NUSANTARA'
+    ).slice(0, 120);
+    const effectiveOwnerId = auth.currentUser?.uid || KIOSK_SYNC_OWNER_ID;
+
+    try {
+      telemetry = { ...telemetry, syncStatus: 'syncing', lastError: null };
+      notifyListeners();
+
+      if (!bundleExistsOnServer && cloudLoadStatus !== 'not_found') {
+        const checkSnap = await getDoc(bundleRef);
+        telemetry.readsUsed += 1;
+        bundleExistsOnServer = checkSnap.exists();
+        if (bundleExistsOnServer) {
+          cloudLoadStatus = 'found';
+          const existingVersion = checkSnap.data()?.version;
+          if (typeof existingVersion === 'number') {
+            telemetry.bundleVersion = existingVersion;
+          }
+        } else {
+          cloudLoadStatus = 'not_found';
+        }
+      }
+
+      const nextVersion = telemetry.bundleVersion + 1;
+
+      if (!bundleExistsOnServer) {
+        await setDoc(bundleRef, {
+          bundleId: MAIN_BUNDLE_ID,
+          ownerId: effectiveOwnerId,
+          schoolName,
+          payloadJson: boundedPayloadJson,
+          version: 1,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        bundleExistsOnServer = true;
+        cloudLoadStatus = 'found';
+        telemetry.bundleVersion = 1;
+      } else {
+        await updateDoc(bundleRef, {
+          ownerId: effectiveOwnerId,
+          schoolName,
+          payloadJson: boundedPayloadJson,
+          version: nextVersion,
+          updatedAt: serverTimestamp(),
+        });
+        telemetry.bundleVersion = nextVersion;
+      }
+
+      lastRawPayloadJson = boundedPayloadJson;
+      lastSyncedFingerprint = nextFingerprint;
+      telemetry = {
+        ...telemetry,
+        writesUsed: telemetry.writesUsed + 1,
+        savedOperations:
+          telemetry.savedOperations + Math.max(estimatedDocsInBundle - 1, 5),
+        lastSyncedAt: new Date().toLocaleTimeString('id-ID', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+        syncStatus: 'synced',
+        lastError: null,
+      };
+      notifyListeners();
+      return true;
+    } catch (err) {
+      const info = handleFirestoreError(
+        err,
+        bundleExistsOnServer ? OperationType.UPDATE : OperationType.CREATE,
+        bundlePath
+      );
+      telemetry = {
+        ...telemetry,
+        syncStatus: 'error',
+        lastError: info.error,
+      };
+      notifyListeners();
+      return false;
+    } finally {
+      flushInFlightPromise = null;
+      if (pendingStateForSync) {
+        const nextPending = pendingStateForSync;
+        pendingStateForSync = null;
+        scheduleQuotaSavingFirestoreSync(nextPending, 400);
+      }
+    }
   };
 
-  const payloadJson = JSON.stringify(serializable);
+  flushInFlightPromise = executeFlush();
+  return flushInFlightPromise;
+}
 
-  // Deduplicate identical writes to save daily write quota
-  if (payloadJson === lastWrittenHash) {
+/**
+ * Schedules a debounced, quota-saving write to Firebase Firestore.
+ * Multiple rapid mutations are coalesced into a single Firestore write after `delayMs`.
+ */
+export function scheduleQuotaSavingFirestoreSync(
+  state: AppStatePayload,
+  delayMs = 900
+): void {
+  saveStateToLocalQuotaCache(state);
+
+  const nextFingerprint = computeContentFingerprint(state);
+  if (nextFingerprint && nextFingerprint === lastSyncedFingerprint && bundleExistsOnServer) {
     telemetry = {
       ...telemetry,
       savedOperations: telemetry.savedOperations + 1,
     };
     notifyListeners();
-    return true;
+    return;
   }
 
-  // Guard against 1MB Firestore document limit (rule cap: 900,000 chars)
-  const boundedPayloadJson =
-    payloadJson.length <= 900000
-      ? payloadJson
-      : JSON.stringify({
-          ...serializable,
-          // Strip large base64 photos if bundle exceeds 900KB
-          students: targetState.students.map((s) => ({ ...s, photo_url: null })),
-        });
-
-  const bundleRef = doc(db, BUNDLE_COLLECTION, MAIN_BUNDLE_ID);
-  const bundlePath = `${BUNDLE_COLLECTION}/${MAIN_BUNDLE_ID}`;
-  const schoolName = (
-    targetState.printSettings?.schoolName || 'SMA NEGERI 1 NUSANTARA'
-  ).slice(0, 120);
-  const nextVersion = telemetry.bundleVersion + 1;
-  const effectiveOwnerId = auth.currentUser?.uid || KIOSK_SYNC_OWNER_ID;
-
-  try {
-    telemetry = { ...telemetry, syncStatus: 'syncing', lastError: null };
-    notifyListeners();
-
-    if (!bundleExistsOnServer) {
-      const checkSnap = await getDoc(bundleRef);
-      telemetry.readsUsed += 1;
-      bundleExistsOnServer = checkSnap.exists();
-      if (bundleExistsOnServer) {
-        const existingVersion = checkSnap.data()?.version;
-        if (typeof existingVersion === 'number') {
-          telemetry.bundleVersion = existingVersion;
-        }
-      }
-    }
-
-    if (!bundleExistsOnServer) {
-      await setDoc(bundleRef, {
-        bundleId: MAIN_BUNDLE_ID,
-        ownerId: effectiveOwnerId,
-        schoolName,
-        payloadJson: boundedPayloadJson,
-        version: 1,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      bundleExistsOnServer = true;
-      telemetry.bundleVersion = 1;
-    } else {
-      await updateDoc(bundleRef, {
-        ownerId: effectiveOwnerId,
-        schoolName,
-        payloadJson: boundedPayloadJson,
-        version: nextVersion,
-        updatedAt: serverTimestamp(),
-      });
-      telemetry.bundleVersion = nextVersion;
-    }
-
-    lastWrittenHash = payloadJson;
-    telemetry = {
-      ...telemetry,
-      writesUsed: telemetry.writesUsed + 1,
-      savedOperations:
-        telemetry.savedOperations + Math.max(estimatedDocsInBundle - 1, 5),
-      lastSyncedAt: new Date().toLocaleTimeString('id-ID', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      }),
-      syncStatus: 'synced',
-      lastError: null,
-    };
-    notifyListeners();
-    return true;
-  } catch (err) {
-    const info = handleFirestoreError(
-      err,
-      bundleExistsOnServer ? OperationType.UPDATE : OperationType.CREATE,
-      bundlePath
-    );
-    telemetry = {
-      ...telemetry,
-      syncStatus: 'error',
-      lastError: info.error,
-    };
-    notifyListeners();
-    return false;
-  }
-}
-
-/**
- * Schedules a debounced, quota-saving write to Firebase Firestore.
- * Multiple rapid mutations (e.g., editing 5 fields or uploading 150 CSV rows)
- * are coalesced into a single Firestore write after `delayMs`.
- */
-export function scheduleQuotaSavingFirestoreSync(
-  state: AppStatePayload,
-  delayMs = 1200
-): void {
   pendingStateForSync = state;
-  saveStateToLocalQuotaCache(state);
 
   if (debounceTimer) {
     clearTimeout(debounceTimer);
@@ -493,69 +576,38 @@ export function scheduleQuotaSavingFirestoreSync(
 }
 
 /**
- * Writes or updates a compact transaction audit record in `/transaction_audits/{txId}`
- * strictly adhering to `isValidTransactionAudit` rules.
+ * Synchronizes borrow/return transactions inside the single consolidated bundle `/kiosk_bundles/main`
+ * so every scan uses at most 1 coalesced Firestore write (saving 50% write quota per scan).
  */
 export async function syncTransactionAuditToFirestore(
-  tx: Transaction,
+  _tx: Transaction,
   state: AppStatePayload,
-  isNewBorrow: boolean
+  _isNewBorrow: boolean
 ): Promise<void> {
-  // Always coalesce state bundle
-  scheduleQuotaSavingFirestoreSync(state, 800);
+  scheduleQuotaSavingFirestoreSync(state, 500);
+}
 
-  const cleanTxId = tx.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-  if (!cleanTxId) return;
-
-  const student = state.students.find((s) => s.id === tx.student_id);
-  const laptop = state.laptops.find((l) => l.id === tx.laptop_id);
-  if (!student || !laptop) return;
-
-  const auditRef = doc(db, AUDIT_COLLECTION, cleanTxId);
-  const auditPath = `${AUDIT_COLLECTION}/${cleanTxId}`;
-  const effectiveOwnerId = auth.currentUser?.uid || KIOSK_SYNC_OWNER_ID;
-
-  try {
-    if (isNewBorrow) {
-      await setDoc(auditRef, {
-        txId: cleanTxId,
-        ownerId: effectiveOwnerId,
-        studentCode: student.student_code.slice(0, 40),
-        studentName: student.name.slice(0, 120),
-        assetCode: laptop.asset_code.slice(0, 40),
-        transactionType: tx.transaction_type === 'pulang' ? 'pulang' : 'harian',
-        status: tx.status === 'returned' ? 'returned' : 'active',
-        purpose: (tx.purpose || 'Sesi Harian').slice(0, 160),
-        piketName: (tx.piket_name || 'Guru Piket').slice(0, 100),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      telemetry.writesUsed += 1;
-      notifyListeners();
-    } else {
-      await updateDoc(auditRef, {
-        ownerId: effectiveOwnerId,
-        status: 'returned',
-        purpose: (tx.purpose || 'Sudah Dikembalikan').slice(0, 160),
-        piketName: (tx.return_piket_name || tx.piket_name || 'Guru Piket').slice(0, 100),
-        updatedAt: serverTimestamp(),
-      });
-      telemetry.writesUsed += 1;
-      notifyListeners();
+// Flush any pending debounced write immediately when the user switches tabs, refreshes, or reconnects
+if (typeof window !== 'undefined') {
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && pendingStateForSync) {
+      flushStateToFirestoreNow();
     }
-  } catch (err) {
-    // If the audit doc didn't exist before return, ignore gracefully as the main bundle stores it
-    handleFirestoreError(
-      err,
-      isNewBorrow ? OperationType.CREATE : OperationType.UPDATE,
-      auditPath
-    );
-  }
+  });
+  window.addEventListener('pagehide', () => {
+    if (pendingStateForSync) {
+      flushStateToFirestoreNow();
+    }
+  });
+  window.addEventListener('online', () => {
+    if (pendingStateForSync) {
+      flushStateToFirestoreNow();
+    }
+  });
 }
 
 /**
  * Connects the Admin's Google account via Firebase Authentication (`laptoptrak`)
- * so that rules (`isSignedIn()` + `ownerId == request.auth.uid`) authorize live cloud writes
  * and immediately syncs the current state in 1 coalesced operation.
  */
 export async function connectFirebaseCloudAccount(
@@ -585,7 +637,6 @@ export async function connectFirebaseCloudAccount(
 
 export async function disconnectFirebaseCloudAccount(): Promise<void> {
   await signOut(auth);
-  bundleExistsOnServer = false;
   telemetry = {
     ...telemetry,
     firebaseUserEmail: null,

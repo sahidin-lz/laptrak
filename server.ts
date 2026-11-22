@@ -54,6 +54,7 @@ interface StoredStaff {
 interface ServerDatabase {
   adminClaimed: boolean;
   studentSeq: number;
+  updatedAtMs: number;
   staff: StoredStaff[];
   students: Student[];
   laptops: Laptop[];
@@ -63,6 +64,8 @@ interface ServerDatabase {
   printSettings: PrintSettings;
   kioskState: KioskPersistedState;
 }
+
+const SERVER_DISK_DB_PATH = path.join('/tmp', 'laptrack_server_db_v1.json');
 
 const revokedTokens = new Set<string>();
 
@@ -698,6 +701,7 @@ function createInitialDb(): ServerDatabase {
   return {
     adminClaimed: Boolean(envAdminPass),
     studentSeq: 7,
+    updatedAtMs: 0,
     staff,
     students,
     laptops,
@@ -709,7 +713,34 @@ function createInitialDb(): ServerDatabase {
   };
 }
 
-let db = createInitialDb();
+function loadServerDbFromDisk(): ServerDatabase {
+  try {
+    if (fs.existsSync(SERVER_DISK_DB_PATH)) {
+      const raw = fs.readFileSync(SERVER_DISK_DB_PATH, 'utf8');
+      const parsed = JSON.parse(raw) as ServerDatabase;
+      if (parsed && Array.isArray(parsed.students) && Array.isArray(parsed.laptops)) {
+        if (typeof parsed.updatedAtMs !== 'number') {
+          parsed.updatedAtMs =
+            parsed.laptops.length > 6 || parsed.students.length > 6 ? Date.now() : 0;
+        }
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore disk read error and fall back to seed
+  }
+  return createInitialDb();
+}
+
+function saveServerDbToDisk(targetDb: ServerDatabase): void {
+  try {
+    fs.writeFileSync(SERVER_DISK_DB_PATH, JSON.stringify(targetDb), 'utf8');
+  } catch {
+    // Ignore read-only filesystem errors
+  }
+}
+
+let db = loadServerDbFromDisk();
 
 interface AuthedRequest extends Request {
   authUser?: AuthUser;
@@ -850,9 +881,14 @@ function ensureServerStudentsHaveLaptopAllocation() {
   }
 }
 
-function buildStateForRole(_role: StaffRole | 'public') {
+function buildStateForRole(_role: StaffRole | 'public', touchModified = true) {
   refreshExpiredSuspensions(db.students);
-  ensureServerStudentsHaveLaptopAllocation();
+  if (touchModified) {
+    db.updatedAtMs = Date.now();
+  } else if (typeof db.updatedAtMs !== 'number') {
+    db.updatedAtMs = db.laptops.length > 6 || db.students.length > 6 ? Date.now() : 0;
+  }
+  saveServerDbToDisk(db);
   return {
     students: db.students,
     laptops: db.laptops,
@@ -863,6 +899,7 @@ function buildStateForRole(_role: StaffRole | 'public') {
     piketOptions: getActivePiketOptions(),
     printSettings: db.printSettings,
     kioskState: db.kioskState,
+    updatedAtMs: db.updatedAtMs,
   };
 }
 
@@ -1053,10 +1090,10 @@ async function startServer() {
   // ==========================================
   app.get('/api/state', (req, res) => {
     const authed = getOptionalAuthUser(req);
-    res.json(buildStateForRole(authed ? authed.role : 'public'));
+    res.json(buildStateForRole(authed ? authed.role : 'public', false));
   });
 
-  // Hydrate server in-memory database from Firebase Firestore Quota-Saving Bundle (/kiosk_bundles/main)
+  // Hydrate server database from Firebase Firestore Quota-Saving Bundle (/kiosk_bundles/main)
   app.post('/api/state/hydrate', (req, res) => {
     const bundle = req.body?.bundle;
     if (!bundle || typeof bundle !== 'object') {
@@ -1064,64 +1101,80 @@ async function startServer() {
       return;
     }
 
-    const incomingLaptopCount = Array.isArray(bundle.laptops) ? bundle.laptops.length : 0;
-    const serverHasMoreUnsyncedData = db.laptops.length > incomingLaptopCount && db.laptops.length > 6;
+    const incomingTime = typeof bundle.updatedAtMs === 'number' ? bundle.updatedAtMs : 0;
+    const serverTime = typeof db.updatedAtMs === 'number' ? db.updatedAtMs : 0;
+    const shouldAdoptIncoming =
+      incomingTime >= serverTime || serverTime === 0 || incomingTime === 0;
 
-    if (!serverHasMoreUnsyncedData) {
-      if (Array.isArray(bundle.students) && bundle.students.length > 0) {
+    if (shouldAdoptIncoming) {
+      if (Array.isArray(bundle.students)) {
         db.students = bundle.students.slice(0, 1000);
         db.studentSeq = Math.max(db.studentSeq, db.students.length + 1);
       }
-      if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
+      if (Array.isArray(bundle.laptops)) {
         db.laptops = bundle.laptops.slice(0, 1000);
       }
-    }
-    if (Array.isArray(bundle.staff) && bundle.staff.length > 0) {
-      for (const incoming of bundle.staff.slice(0, 200)) {
-        const existing = db.staff.find(
-          (s) =>
-            s.id === incoming.id ||
-            s.username.toLowerCase() === incoming.username.toLowerCase() ||
-            s.piket_token.toUpperCase() === incoming.piket_token.toUpperCase()
-        );
-        if (existing) {
-          existing.name = incoming.name;
-          existing.piket_token = incoming.piket_token;
-          existing.wilayah = incoming.wilayah;
-          existing.role = incoming.role;
-          existing.is_active = incoming.is_active;
-        } else {
-          db.staff.push({
-            ...incoming,
-            passwordHash: hashPassword('121320'),
-          });
+      if (Array.isArray(bundle.transactions)) {
+        const nowMs = Date.now();
+        const incomingTxs = bundle.transactions.slice(0, 2000);
+        const incomingIds = new Set(incomingTxs.map((t: Transaction) => t.id));
+        const recentServerOnly = db.transactions.filter((t) => {
+          if (incomingIds.has(t.id)) return false;
+          const bMs = new Date(t.borrow_time).getTime();
+          return !Number.isNaN(bMs) && nowMs - bMs < 15000;
+        });
+        db.transactions = [...recentServerOnly, ...incomingTxs];
+        if (recentServerOnly.length > 0) {
+          const activeLaptopIds = new Set(
+            db.transactions
+              .filter((t) => t.status === 'active')
+              .map((t) => t.laptop_id)
+          );
+          db.laptops = db.laptops.map((l) =>
+            activeLaptopIds.has(l.id) ? { ...l, status: 'borrowed' } : l
+          );
         }
       }
+      if (Array.isArray(bundle.schedules)) {
+        db.schedules = bundle.schedules.slice(0, 200);
+      }
+      if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
+        db.dailySessions = bundle.dailySessions;
+      }
+      if (bundle.printSettings && typeof bundle.printSettings === 'object') {
+        db.printSettings = {
+          ...db.printSettings,
+          ...bundle.printSettings,
+        };
+      }
+      if (bundle.kioskState && typeof bundle.kioskState === 'object') {
+        db.kioskState = {
+          ...db.kioskState,
+          ...bundle.kioskState,
+          activePage: db.kioskState.activePage || bundle.kioskState.activePage || 'scan',
+        };
+      }
+      db.updatedAtMs = Math.max(incomingTime, serverTime);
     }
-    if (Array.isArray(bundle.schedules) && bundle.schedules.length > 0) {
-      db.schedules = bundle.schedules.slice(0, 200);
-    }
-    if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
-      db.dailySessions = bundle.dailySessions;
-    }
-    if (Array.isArray(bundle.transactions)) {
-      db.transactions = bundle.transactions.slice(0, 2000);
-    }
-    if (bundle.printSettings && typeof bundle.printSettings === 'object') {
-      db.printSettings = {
-        ...db.printSettings,
-        ...bundle.printSettings,
-      };
-    }
-    if (bundle.kioskState && typeof bundle.kioskState === 'object') {
-      db.kioskState = {
-        ...db.kioskState,
-        ...bundle.kioskState,
-      };
+
+    if (Array.isArray(bundle.staff) && bundle.staff.length > 0 && shouldAdoptIncoming) {
+      const prevHashes = new Map<string, string | null>();
+      for (const s of db.staff) {
+        prevHashes.set(s.id, s.passwordHash);
+        prevHashes.set(s.username.toLowerCase(), s.passwordHash);
+      }
+      const defaultHash = hashPassword('121320');
+      db.staff = bundle.staff.slice(0, 200).map((incoming: StoredStaff) => ({
+        ...incoming,
+        passwordHash:
+          prevHashes.get(incoming.id) ||
+          prevHashes.get((incoming.username || '').toLowerCase()) ||
+          defaultHash,
+      }));
     }
 
     const authed = getOptionalAuthUser(req);
-    res.json(buildStateForRole(authed ? authed.role : 'public'));
+    res.json(buildStateForRole(authed ? authed.role : 'public', false));
   });
 
   // Persists activePage, wizardStep, piketTicket, selectedSessionKey, scanMode across browser refreshes
@@ -1598,6 +1651,7 @@ async function startServer() {
       created_at: new Date().toISOString(),
     };
     db.students.push(created);
+    ensureServerStudentsHaveLaptopAllocation();
     res.json({ student: created, state: buildStateForRole('admin') });
   });
 
@@ -1721,6 +1775,8 @@ async function startServer() {
         }
       }
     }
+
+    ensureServerStudentsHaveLaptopAllocation();
 
     res.json({
       createdStudents,

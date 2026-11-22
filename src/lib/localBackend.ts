@@ -621,7 +621,6 @@ function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
 
 function buildAppState(touchModified = true): AppStatePayload {
   refreshExpiredSuspensions(localDb.students);
-  ensureStudentsHaveLaptopAllocation(localDb);
 
   if (touchModified) {
     localDb.updatedAtMs = Date.now();
@@ -658,6 +657,49 @@ function buildAppState(touchModified = true): AppStatePayload {
     kioskState: { ...localDb.kioskState },
     updatedAtMs: localDb.updatedAtMs,
   };
+}
+
+/**
+ * Mirrors an authoritative AppStatePayload (e.g. from Express `/api/*` or Firestore)
+ * directly into localDb and `localStorage` so refresh/offline fallback always matches 100%.
+ */
+export function mirrorStateToLocalDb(state: Partial<AppStatePayload> | null | undefined): void {
+  if (!state || !Array.isArray(state.students) || !Array.isArray(state.laptops)) return;
+  localDb.students = [...state.students];
+  localDb.studentSeq = Math.max(localDb.studentSeq, localDb.students.length + 1);
+  localDb.laptops = [...state.laptops];
+  if (Array.isArray(state.transactions)) {
+    localDb.transactions = [...state.transactions];
+  }
+  if (Array.isArray(state.schedules)) {
+    localDb.schedules = [...state.schedules];
+  }
+  if (Array.isArray(state.dailySessions) && state.dailySessions.length === 3) {
+    localDb.dailySessions = [...state.dailySessions];
+  }
+  if (state.printSettings) {
+    localDb.printSettings = { ...localDb.printSettings, ...state.printSettings };
+  }
+  if (state.kioskState) {
+    localDb.kioskState = {
+      ...localDb.kioskState,
+      ...state.kioskState,
+      activePage: localDb.kioskState.activePage || state.kioskState.activePage || 'scan',
+    };
+  }
+  if (Array.isArray(state.staff) && state.staff.length > 0) {
+    const prevPasswords = new Map(
+      localDb.staff.map((s) => [s.id, s.passwordPlain])
+    );
+    localDb.staff = state.staff.map((incoming) => ({
+      ...incoming,
+      passwordPlain: prevPasswords.get(incoming.id) || '121320',
+    }));
+  }
+  if (typeof state.updatedAtMs === 'number' && state.updatedAtMs > 0) {
+    localDb.updatedAtMs = state.updatedAtMs;
+  }
+  saveLocalDb(localDb);
 }
 
 function computeDueTimeFromDailySession(
@@ -788,28 +830,44 @@ export const localBackend = {
   hydrateState: async (bundle: Partial<AppStatePayload>): Promise<AppStatePayload> => {
     const incomingTime = typeof bundle.updatedAtMs === 'number' ? bundle.updatedAtMs : 0;
     const localTime = typeof localDb.updatedAtMs === 'number' ? localDb.updatedAtMs : 0;
-    const incomingLaptopCount = Array.isArray(bundle.laptops) ? bundle.laptops.length : 0;
-    const localLaptopCount = localDb.laptops.length;
 
-    // Determine whether the incoming Firestore bundle is the newer/authoritative dataset
-    // (e.g., HP receiving 106 laptops from Firestore) OR whether this device (e.g., Laptop
-    // that already had 106 laptops in localStorage before cloud sync) has more/newer data.
-    const localHasMoreUnsyncedData =
-      localLaptopCount > incomingLaptopCount && localTime >= incomingTime;
+    // Adopt the incoming bundle whenever it is newer/equal (`incomingTime >= localTime`),
+    // or when this device is still on initial seed state (`localTime === 0`).
+    const shouldAdoptIncoming =
+      incomingTime >= localTime || localTime === 0 || incomingTime === 0;
 
-    if (!localHasMoreUnsyncedData) {
-      // Adopt exact dataset from Firestore bundle so HP matches Laptop 100% (e.g. exact 106 laptops)
-      if (Array.isArray(bundle.students) && bundle.students.length > 0) {
+    if (shouldAdoptIncoming) {
+      if (Array.isArray(bundle.students)) {
         localDb.students = [...bundle.students];
         localDb.studentSeq = Math.max(localDb.studentSeq, localDb.students.length + 1);
       }
-      if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
+      if (Array.isArray(bundle.laptops)) {
         localDb.laptops = [...bundle.laptops];
       }
       if (Array.isArray(bundle.transactions)) {
-        localDb.transactions = [...bundle.transactions];
+        // Preserve any brand-new local transaction created in the last 15 seconds that hasn't reached cloud yet
+        const nowMs = Date.now();
+        const incomingIds = new Set(bundle.transactions.map((t) => t.id));
+        const recentLocalOnly = localDb.transactions.filter((t) => {
+          if (incomingIds.has(t.id)) return false;
+          const bMs = new Date(t.borrow_time).getTime();
+          return !Number.isNaN(bMs) && nowMs - bMs < 15000;
+        });
+        localDb.transactions = [...recentLocalOnly, ...bundle.transactions];
+
+        // Keep laptop borrowed status consistent with any recent local-only transaction
+        if (recentLocalOnly.length > 0) {
+          const activeLaptopIds = new Set(
+            localDb.transactions
+              .filter((t) => t.status === 'active')
+              .map((t) => t.laptop_id)
+          );
+          localDb.laptops = localDb.laptops.map((l) =>
+            activeLaptopIds.has(l.id) ? { ...l, status: 'borrowed' } : l
+          );
+        }
       }
-      if (Array.isArray(bundle.schedules) && bundle.schedules.length > 0) {
+      if (Array.isArray(bundle.schedules)) {
         localDb.schedules = [...bundle.schedules];
       }
       if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
@@ -818,35 +876,38 @@ export const localBackend = {
       if (bundle.printSettings) {
         localDb.printSettings = { ...localDb.printSettings, ...bundle.printSettings };
       }
+      if (bundle.kioskState) {
+        localDb.kioskState = {
+          ...localDb.kioskState,
+          piketTicket:
+            bundle.kioskState.piketTicket !== undefined
+              ? bundle.kioskState.piketTicket
+              : localDb.kioskState.piketTicket,
+          selectedWilayah:
+            bundle.kioskState.selectedWilayah || localDb.kioskState.selectedWilayah,
+          scanMode: bundle.kioskState.scanMode || localDb.kioskState.scanMode,
+          selectedSessionKey:
+            bundle.kioskState.selectedSessionKey || localDb.kioskState.selectedSessionKey,
+          wizardStep: bundle.kioskState.wizardStep || localDb.kioskState.wizardStep,
+        };
+      }
       localDb.updatedAtMs = Math.max(incomingTime, localTime);
-    } else {
-      // This device (e.g. Laptop with 106 uploaded laptops) has more local data than Firestore:
-      // keep local students & laptops intact and stamp updatedAtMs so it immediately pushes to Firestore
-      localDb.updatedAtMs = Math.max(localTime, Date.now());
     }
 
-    // Always merge staff / Guru Piket accounts so custom tokens and built-in admins both remain active
-    if (Array.isArray(bundle.staff) && bundle.staff.length > 0) {
-      for (const incoming of bundle.staff) {
-        const existing = localDb.staff.find(
-          (s) =>
-            s.id === incoming.id ||
-            s.username.toLowerCase() === incoming.username.toLowerCase() ||
-            s.piket_token.toUpperCase() === incoming.piket_token.toUpperCase()
-        );
-        if (existing) {
-          existing.name = incoming.name;
-          existing.piket_token = incoming.piket_token;
-          existing.wilayah = incoming.wilayah;
-          existing.role = incoming.role;
-          existing.is_active = incoming.is_active;
-        } else {
-          localDb.staff.push({
-            ...incoming,
-            passwordPlain: '121320',
-          });
-        }
+    // Sync staff accounts while preserving local passwords
+    if (Array.isArray(bundle.staff) && bundle.staff.length > 0 && shouldAdoptIncoming) {
+      const prevPasswords = new Map<string, string>();
+      for (const s of localDb.staff) {
+        prevPasswords.set(s.id, s.passwordPlain);
+        prevPasswords.set(s.username.toLowerCase(), s.passwordPlain);
       }
+      localDb.staff = bundle.staff.map((incoming) => ({
+        ...incoming,
+        passwordPlain:
+          prevPasswords.get(incoming.id) ||
+          prevPasswords.get(incoming.username.toLowerCase()) ||
+          '121320',
+      }));
     }
 
     return buildAppState(false);
@@ -1230,6 +1291,7 @@ export const localBackend = {
       created_at: new Date().toISOString(),
     };
     localDb.students.push(created);
+    ensureStudentsHaveLaptopAllocation(localDb);
     return {
       student: { student_code: created.student_code, name: created.name },
       state: buildAppState(),
@@ -1351,6 +1413,8 @@ export const localBackend = {
         }
       }
     }
+
+    ensureStudentsHaveLaptopAllocation(localDb);
 
     return {
       createdStudents,

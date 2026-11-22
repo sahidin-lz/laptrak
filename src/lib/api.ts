@@ -14,7 +14,7 @@ import {
   TransactionType,
   Wilayah,
 } from '../types/models';
-import { localBackend } from './localBackend';
+import { localBackend, mirrorStateToLocalDb } from './localBackend';
 
 let authTokenMemory: string | null = null;
 let useLocalServerlessFallback = false;
@@ -103,6 +103,19 @@ async function requestWithFallback<T>(
         data.correctedLabel
       );
     }
+
+    // Mirror any authoritative state returned by Express `/api/*` directly into browser localStorage
+    // so that local storage, Express server, and Firebase cache remain 100% identical.
+    if (data && typeof data === 'object') {
+      if ('state' in data && data.state && typeof data.state === 'object') {
+        mirrorStateToLocalDb(data.state as Partial<AppStatePayload>);
+      } else if ('students' in data && 'laptops' in data) {
+        mirrorStateToLocalDb(data as Partial<AppStatePayload>);
+      } else if ('kioskState' in data && data.kioskState) {
+        localBackend.updateKioskState(data.kioskState).catch(() => null);
+      }
+    }
+
     return data as T;
   } catch (err) {
     if (err instanceof ApiError) {

@@ -34,12 +34,16 @@ import {
   disconnectFirebaseCloudAccount,
   FirebaseQuotaTelemetry,
   flushStateToFirestoreNow,
+  getLastCloudLoadStatus,
   loadBundleFromFirestoreOnce,
+  loadStateFromLocalQuotaCache,
+  saveStateToLocalQuotaCache,
   scheduleQuotaSavingFirestoreSync,
   subscribeFirebaseTelemetry,
   subscribeToCloudKioskBundle,
   syncTransactionAuditToFirestore,
 } from './lib/firebase';
+import { localBackend } from './lib/localBackend';
 import {
   isStudentCurrentlySuspended,
   ParsedLaptopCsvRow,
@@ -120,40 +124,65 @@ export default function App() {
   const initializeApp = useCallback(async () => {
     setLoadingState(true);
     try {
-      const [meRes, serverStateRes, cachedOrFirestoreBundle] = await Promise.all([
-        api.getMe().catch(() => ({ user: null })),
-        api.getState(),
-        loadBundleFromFirestoreOnce().catch(() => null),
-      ]);
+      const [meRes, serverStateRes, localStorageStateRes, cachedOrFirestoreBundle] =
+        await Promise.all([
+          api.getMe().catch(() => ({ user: null })),
+          api.getState(),
+          localBackend.getState().catch(() => null),
+          loadBundleFromFirestoreOnce().catch(() => null),
+        ]);
 
-      let effectiveState = serverStateRes;
-      const cloudLaptopCount = Array.isArray(cachedOrFirestoreBundle?.laptops)
-        ? cachedOrFirestoreBundle.laptops.length
-        : 0;
-      const cloudStudentCount = Array.isArray(cachedOrFirestoreBundle?.students)
-        ? cachedOrFirestoreBundle.students.length
-        : 0;
+      const cloudStatus = getLastCloudLoadStatus();
+      const serverTime =
+        typeof serverStateRes?.updatedAtMs === 'number' ? serverStateRes.updatedAtMs : 0;
+      const localTime =
+        typeof localStorageStateRes?.updatedAtMs === 'number'
+          ? localStorageStateRes.updatedAtMs
+          : 0;
+      const cloudTime =
+        typeof cachedOrFirestoreBundle?.updatedAtMs === 'number'
+          ? cachedOrFirestoreBundle.updatedAtMs
+          : 0;
 
-      // If we have a persisted bundle from Firebase Firestore or local quota cache,
-      // hydrate the backend in 1 call so both device & Firebase match.
+      // Pick the freshest authoritative dataset across Firestore, localStorage, and Express server
+      let bestBundle: Partial<AppStatePayload> = serverStateRes;
+      let bestTime = serverTime;
+
+      if (
+        localStorageStateRes &&
+        (localTime > bestTime ||
+          (localTime === bestTime &&
+            localStorageStateRes.laptops.length > (bestBundle.laptops?.length || 0)))
+      ) {
+        bestBundle = localStorageStateRes;
+        bestTime = localTime;
+      }
+
       if (
         cachedOrFirestoreBundle &&
         Array.isArray(cachedOrFirestoreBundle.students) &&
-        cachedOrFirestoreBundle.students.length > 0
+        cachedOrFirestoreBundle.students.length > 0 &&
+        (cloudTime >= bestTime || bestTime === 0)
       ) {
-        try {
-          effectiveState = await api.hydrateState(cachedOrFirestoreBundle);
-        } catch {
-          effectiveState = serverStateRes;
-        }
+        bestBundle = cachedOrFirestoreBundle;
+        bestTime = cloudTime;
       }
 
-      // If this device (e.g. Laptop where 106 laptops were uploaded) has MORE data than Firestore,
-      // flush it immediately to Firebase Firestore so the HP receives all 106 laptops right away!
+      let effectiveState = serverStateRes;
+      try {
+        effectiveState = await api.hydrateState(bestBundle);
+      } catch {
+        effectiveState = serverStateRes;
+      }
+
+      saveStateToLocalQuotaCache(effectiveState);
+
+      // Push to Firestore ONLY if:
+      // 1. The cloud document genuinely does not exist yet on Firestore (`cloudStatus === 'not_found'`), OR
+      // 2. This device has newer unsynced changes (`bestTime > cloudTime` and `cloudStatus === 'found'`)
       if (
-        !cachedOrFirestoreBundle ||
-        effectiveState.laptops.length > cloudLaptopCount ||
-        effectiveState.students.length > cloudStudentCount
+        cloudStatus === 'not_found' ||
+        (cloudStatus === 'found' && bestTime > cloudTime)
       ) {
         flushStateToFirestoreNow(effectiveState);
       }
@@ -172,7 +201,9 @@ export default function App() {
         setUser(null);
       }
       // Guarantee state is never null even on static hosting (Vercel)
-      const fallbackState = await api.getState().catch(() => null);
+      const fallbackState =
+        (await api.getState().catch(() => null)) ||
+        (await localBackend.getState().catch(() => null));
       if (fallbackState) {
         setState(fallbackState);
       }
@@ -185,16 +216,17 @@ export default function App() {
     initializeApp();
   }, [initializeApp]);
 
-  // Real-time cross-device cloud sync listener (Laptop <-> HP on Vercel)
+  // Real-time cross-device cloud sync listener (Laptop <-> HP on Vercel & AI Studio)
   useEffect(() => {
     const unsub = subscribeToCloudKioskBundle(async (remoteBundle) => {
       if (
         remoteBundle &&
-        Array.isArray(remoteBundle.laptops) &&
-        remoteBundle.laptops.length > 0
+        Array.isArray(remoteBundle.students) &&
+        Array.isArray(remoteBundle.laptops)
       ) {
         try {
           const hydrated = await api.hydrateState(remoteBundle);
+          saveStateToLocalQuotaCache(hydrated);
           setState(hydrated);
         } catch {
           // Ignore transient hydration error
@@ -204,12 +236,42 @@ export default function App() {
     return unsub;
   }, []);
 
+  // Zero-quota instant cross-tab sync within the same browser
+  useEffect(() => {
+    const onStorageChange = async (e: StorageEvent) => {
+      if (
+        e.key === 'laptrack_firebase_quota_cache_v1' ||
+        e.key === 'laptrack_serverless_db_v1'
+      ) {
+        const cached = loadStateFromLocalQuotaCache();
+        if (cached && Array.isArray(cached.students) && Array.isArray(cached.laptops)) {
+          try {
+            const hydrated = await api.hydrateState(cached);
+            setState(hydrated);
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    };
+    window.addEventListener('storage', onStorageChange);
+    return () => window.removeEventListener('storage', onStorageChange);
+  }, []);
+
   const handleUpdateKioskState = useCallback(
-    (patch: Partial<KioskPersistedState>) => {
+    (patch: Partial<KioskPersistedState>, syncToCloud = false) => {
       setState((prev) => {
         if (!prev) return prev;
-        const next = { ...prev, kioskState: { ...prev.kioskState, ...patch } };
-        scheduleQuotaSavingFirestoreSync(next, 3000);
+        const next: AppStatePayload = {
+          ...prev,
+          kioskState: { ...prev.kioskState, ...patch },
+          updatedAtMs: syncToCloud ? Date.now() : prev.updatedAtMs,
+        };
+        if (syncToCloud) {
+          scheduleQuotaSavingFirestoreSync(next, 1200);
+        } else {
+          saveStateToLocalQuotaCache(next);
+        }
         return next;
       });
       api.updateKioskState(patch).catch(() => {
@@ -222,7 +284,7 @@ export default function App() {
   const handleSwitchPage = useCallback(
     (nextPage: ActivePage) => {
       setActivePage(nextPage);
-      handleUpdateKioskState({ activePage: nextPage });
+      handleUpdateKioskState({ activePage: nextPage }, false);
     },
     [handleUpdateKioskState]
   );

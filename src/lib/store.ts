@@ -680,18 +680,12 @@ export function extractPrefixAndNumber(raw: string): { prefix: string; num: numb
 }
 
 /**
- * Intelligently matches a scanned QR / 1D Barcode string to a Student.
- * Supports:
- * 1. Exact `student_code` (e.g. "SIS-0007")
- * 2. Compact / unpadded `student_code` (e.g. "SIS0007", "SIS-7", "0007", "7")
- * 3. The student's assigned `laptop.asset_code` from template (e.g. "LAP-007", "LAP007", "LAP-7")
- * 4. Student name match (if barcode/QR was generated from student name)
- * 5. Substring match inside multi-field QR codes
+ * Strictly checks if a scanned code matches a Student Card (`SIS-XXXX` or `student.student_code` or student name)
+ * WITHOUT matching a Laptop Bag Tag (`LAP-XXX`). Used in Phase 1 (Scan Kartu Siswa) of the sequential scanner.
  */
-export function findStudentByScannedCode(
+export function findStudentCardStrict(
   rawCode: string,
-  students: Student[],
-  laptops: Laptop[]
+  students: Student[]
 ): Student | null {
   const clean = (rawCode || '').trim();
   if (!clean) return null;
@@ -699,17 +693,20 @@ export function findStudentByScannedCode(
   const compact = normalizeCodeCompact(upper);
   const parsedScan = extractPrefixAndNumber(upper);
 
-  // 1. Exact student_code match
+  // Reject explicit Laptop Bag Tag prefixes in strict Student Card mode unless a student literally has that exact student_code
   const exactStudent = students.find((s) => s.student_code.trim().toUpperCase() === upper);
   if (exactStudent) return exactStudent;
 
-  // 2. Compact student_code match (e.g. "SIS0007" == "SIS-0007")
   const compactStudent = students.find(
     (s) => normalizeCodeCompact(s.student_code) === compact
   );
   if (compactStudent) return compactStudent;
 
-  // 3. Prefix + number match for SIS-XXXX (e.g. "SIS-7" or "0007" or "7" when scanning student card)
+  if (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS') {
+    return null;
+  }
+
+  // Prefix + number match for SIS-XXXX (e.g. "SIS-7", "SIS0007", "0007", "7")
   if (
     parsedScan.num !== null &&
     (parsedScan.prefix === 'SIS' || parsedScan.prefix === '' || parsedScan.prefix === 'SISWA')
@@ -721,23 +718,7 @@ export function findStudentByScannedCode(
     if (numMatched) return numMatched;
   }
 
-  // 4. Match via assigned Laptop asset_code (if user scanned `kode_laptop` from template on Step 1!)
-  const matchedLaptop =
-    laptops.find((l) => l.asset_code.trim().toUpperCase() === upper) ||
-    laptops.find((l) => normalizeCodeCompact(l.asset_code) === compact) ||
-    (parsedScan.num !== null && (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS')
-      ? laptops.find((l) => {
-          const lp = extractPrefixAndNumber(l.asset_code);
-          return lp.num !== null && lp.num === parsedScan.num;
-        })
-      : undefined);
-
-  if (matchedLaptop?.assigned_student_id) {
-    const owner = students.find((s) => s.id === matchedLaptop.assigned_student_id);
-    if (owner) return owner;
-  }
-
-  // 5. Exact or compact student Name match (if user created barcode from student's name)
+  // Exact or compact student Name match
   const nameMatched = students.find(
     (s) =>
       s.name.trim().toUpperCase() === upper ||
@@ -745,7 +726,7 @@ export function findStudentByScannedCode(
   );
   if (nameMatched) return nameMatched;
 
-  // 6. Substring match inside multi-field QR text (e.g., "SIS-0007 | Rina Putri")
+  // Substring match inside multi-field Student Card QR text (e.g., "SIS-0007 | Rina Putri")
   const substringStudent = students.find(
     (s) =>
       upper.includes(s.student_code.trim().toUpperCase()) ||
@@ -753,33 +734,16 @@ export function findStudentByScannedCode(
   );
   if (substringStudent) return substringStudent;
 
-  // 7. Numeric match against assigned laptop if no prefix was typed/scanned
-  if (parsedScan.num !== null && parsedScan.prefix === '') {
-    const lapByNum = laptops.find((l) => {
-      const lp = extractPrefixAndNumber(l.asset_code);
-      return lp.num !== null && lp.num === parsedScan.num && Boolean(l.assigned_student_id);
-    });
-    if (lapByNum?.assigned_student_id) {
-      const owner = students.find((s) => s.id === lapByNum.assigned_student_id);
-      if (owner) return owner;
-    }
-  }
-
   return null;
 }
 
 /**
- * Intelligently matches a scanned QR / 1D Barcode string to a Laptop on Step 2 (Scan Gantungan Tas).
- * Supports:
- * 1. Exact `asset_code` (e.g. "LAP-007")
- * 2. Compact / unpadded `asset_code` (e.g. "LAP007", "LAP-7", "007", "7")
- * 3. Substring match inside multi-field QR text
- * 4. If user scans the verified student's card/code again, resolves to their assigned laptop
+ * Strictly checks if a scanned code matches a Laptop Bag Tag (`LAP-XXX` or `laptop.asset_code`)
+ * WITHOUT accepting a Student Card (`SIS-XXXX`). Used in Phase 2 (Scan Gantungan Tas) of the sequential scanner.
  */
-export function findLaptopByScannedCode(
+export function findLaptopBagStrict(
   rawCode: string,
   laptops: Laptop[],
-  students: Student[],
   currentScannedStudent?: Student | null
 ): Laptop | null {
   const clean = (rawCode || '').trim();
@@ -796,12 +760,16 @@ export function findLaptopByScannedCode(
   const compactLaptop = laptops.find((l) => normalizeCodeCompact(l.asset_code) === compact);
   if (compactLaptop) return compactLaptop;
 
-  // 3. Prefix + number match for LAP-XXX (e.g. "LAP-7" or "007" or "7")
+  // Reject explicit Student Card prefixes in strict Bag Tag mode
+  if (parsedScan.prefix === 'SIS' || parsedScan.prefix === 'SISWA') {
+    return null;
+  }
+
+  // 3. Prefix + number match for LAP-XXX / TAS-XXX (or bare number when scanning bag tag)
   if (
     parsedScan.num !== null &&
     (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS' || parsedScan.prefix === '')
   ) {
-    // Prefer the laptop owned by currentScannedStudent if number matches
     if (currentScannedStudent) {
       const ownedMatch = laptops.find((l) => {
         const lp = extractPrefixAndNumber(l.asset_code);
@@ -820,35 +788,44 @@ export function findLaptopByScannedCode(
     if (numMatched) return numMatched;
   }
 
-  // 4. Substring match inside multi-field QR text
+  // 4. Substring match inside multi-field Bag Tag QR text (e.g., "LAP-007 | Lenovo")
   const substringLaptop = laptops.find((l) =>
     upper.includes(l.asset_code.trim().toUpperCase())
   );
   if (substringLaptop) return substringLaptop;
 
-  // 5. If user scanned the student card (`SIS-XXXX` or student name) on Scan 2, resolve to that student's assigned laptop
-  if (currentScannedStudent) {
-    const isSameStudentCode =
-      currentScannedStudent.student_code.trim().toUpperCase() === upper ||
-      normalizeCodeCompact(currentScannedStudent.student_code) === compact ||
-      currentScannedStudent.name.trim().toUpperCase() === upper;
-    if (isSameStudentCode) {
-      const assigned = laptops.find((l) => l.assigned_student_id === currentScannedStudent.id);
-      if (assigned) return assigned;
-    }
-  }
+  return null;
+}
 
-  const matchedStudent = students.find(
-    (s) =>
-      s.student_code.trim().toUpperCase() === upper ||
-      normalizeCodeCompact(s.student_code) === compact
-  );
-  if (matchedStudent) {
-    const assigned = laptops.find((l) => l.assigned_student_id === matchedStudent.id);
-    if (assigned) return assigned;
+/**
+ * General student lookup (used for CSV imports and admin search).
+ */
+export function findStudentByScannedCode(
+  rawCode: string,
+  students: Student[],
+  laptops: Laptop[]
+): Student | null {
+  const strictStudent = findStudentCardStrict(rawCode, students);
+  if (strictStudent) return strictStudent;
+
+  const matchedLaptop = findLaptopBagStrict(rawCode, laptops);
+  if (matchedLaptop?.assigned_student_id) {
+    return students.find((s) => s.id === matchedLaptop.assigned_student_id) || null;
   }
 
   return null;
+}
+
+/**
+ * Strict Laptop Bag Tag lookup for Phase 2 (Scan Gantungan Tas).
+ */
+export function findLaptopByScannedCode(
+  rawCode: string,
+  laptops: Laptop[],
+  _students?: Student[],
+  currentScannedStudent?: Student | null
+): Laptop | null {
+  return findLaptopBagStrict(rawCode, laptops, currentScannedStudent);
 }
 
 export function formatDateTimeID(iso: string | null): string {

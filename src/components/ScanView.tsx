@@ -1,7 +1,8 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
+  ArrowRight,
   CheckCircle2,
   Clock,
   Edit3,
@@ -38,13 +39,14 @@ import {
 } from '../types/models';
 import { api, ApiError, BorrowPayload } from '../lib/api';
 import {
-  findLaptopByScannedCode,
-  findStudentByScannedCode,
+  findLaptopBagStrict,
+  findStudentCardStrict,
   formatDateOnly,
   formatTimeOnly,
   getCurrentSuggestedSessionKey,
   getDefaultReturnDateInput,
   isStudentCurrentlySuspended,
+  normalizeCodeCompact,
   validateDailySessionSelection,
 } from '../lib/store';
 import { playFeedback } from '../lib/sound';
@@ -75,7 +77,7 @@ interface ScanViewProps {
   dailySessions: DailySessionConfig[];
   transactions: Transaction[];
   kioskState: KioskPersistedState;
-  onUpdateKioskState: (patch: Partial<KioskPersistedState>) => void;
+  onUpdateKioskState: (patch: Partial<KioskPersistedState>, syncToCloud?: boolean) => void;
   onBorrow: (
     payload: BorrowPayload
   ) => Promise<{
@@ -117,6 +119,34 @@ export function ScanView({
   onReturn,
   onOpenAdminLogin,
 }: ScanViewProps) {
+  // Live clock to keep automatic session selection & verification up-to-date
+  const [nowClock, setNowClock] = useState<Date>(() => new Date());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowClock(new Date());
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const autoSuggestedSessionKey = useMemo(
+    () => getCurrentSuggestedSessionKey(dailySessions, nowClock),
+    [dailySessions, nowClock]
+  );
+
+  const autoSuggestedSessionConfig = useMemo(
+    () =>
+      dailySessions.find((s) => s.key === autoSuggestedSessionKey) ||
+      dailySessions[0] || {
+        key: 'siang' as const,
+        label: 'Sesi Siang',
+        start_time: '12:30',
+        deadline_time: '14:30',
+        is_active: true,
+      },
+    [dailySessions, autoSuggestedSessionKey]
+  );
+
   // Single-screen wizard state hydrated from server-persisted kioskState so F5 refresh stays on the last screen & logged in
   const [wizardStep, setWizardStep] = useState<KioskWizardStep>(() => {
     if (kioskState.piketTicket) {
@@ -143,9 +173,14 @@ export function ScanView({
   const [scanMode, setScanMode] = useState<TransactionType>(
     () => kioskState.scanMode || 'harian'
   );
-  const [selectedSessionKey, setSelectedSessionKey] = useState<DailySessionKey>(
-    () => kioskState.selectedSessionKey || getCurrentSuggestedSessionKey()
-  );
+  const [selectedSessionKey, setSelectedSessionKey] = useState<DailySessionKey>(() => {
+    const saved = kioskState.selectedSessionKey;
+    if (saved === 'kegiatan_lainnya') return saved;
+    const autoKey = getCurrentSuggestedSessionKey(dailySessions, new Date());
+    if (!saved) return autoKey;
+    const check = validateDailySessionSelection(saved, dailySessions, new Date());
+    return check.allowed ? saved : check.correctedSession;
+  });
   const [customActivityInput, setCustomActivityInput] = useState(
     () => kioskState.customActivityInput || ''
   );
@@ -165,24 +200,53 @@ export function ScanView({
     correctedSession: 'siang' | 'sore' | 'malam';
     correctedLabel: string;
   } | null>(null);
+  const [liveSessionAutoAdjustedBanner, setLiveSessionAutoAdjustedBanner] = useState<string | null>(
+    null
+  );
 
-  // Step 3: 2-Step Scan (1. Scan Kartu Siswa -> 2. Keluar Data Siswa & Masuk Kamera Scan Tas)
+  // Step 3: Strict 2-Step Sequential Scan (1. Kartu Siswa -> 2. Gantungan Tas Laptop)
   const [scanPhase, setScanPhase] = useState<StudentScanPhase>('scan_card');
   const [scannedStudentId, setScannedStudentId] = useState<string | null>(null);
   const [manualInputCode, setManualInputCode] = useState('');
   const [inlineScanError, setInlineScanError] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
 
+  // Guard ref to prevent leftover camera frame of Kartu Siswa from immediately triggering an error in Phase 2
+  const lastVerifiedCardRef = useRef<{
+    rawCode: string;
+    studentCode: string;
+    verifiedAtMs: number;
+  }>({
+    rawCode: '',
+    studentCode: '',
+    verifiedAtMs: 0,
+  });
+
   // Step 4: Large Validation Panel state
   const [validationResult, setValidationResult] = useState<ValidationPanelData | null>(null);
 
-  // Sync from server kioskState when initial state arrives
+  // Sync from server kioskState when initial state arrives, while ensuring daily session matches current system clock
   useEffect(() => {
     if (kioskState.piketTicket && !piketTicket) {
       setPiketTicket(kioskState.piketTicket);
       setSelectedWilayah(kioskState.selectedWilayah);
       setScanMode(kioskState.scanMode);
-      setSelectedSessionKey(kioskState.selectedSessionKey);
+
+      const incomingSession = kioskState.selectedSessionKey;
+      if (incomingSession === 'kegiatan_lainnya') {
+        setSelectedSessionKey('kegiatan_lainnya');
+      } else {
+        const check = validateDailySessionSelection(
+          incomingSession || autoSuggestedSessionKey,
+          dailySessions,
+          new Date()
+        );
+        const verifiedKey = check.allowed
+          ? incomingSession || autoSuggestedSessionKey
+          : check.correctedSession;
+        setSelectedSessionKey(verifiedKey);
+      }
+
       setCustomActivityInput(kioskState.customActivityInput);
       setCustomDeadlineTime(kioskState.customDeadlineTime);
       setPlannedReturnDate(kioskState.plannedReturnDate);
@@ -194,17 +258,39 @@ export function ScanView({
           : kioskState.wizardStep;
       setWizardStep(restoredStep);
     }
-  }, [kioskState, piketTicket]);
+  }, [kioskState, piketTicket, dailySessions, autoSuggestedSessionKey]);
+
+  // Ensure daily session (siang/sore/malam) is always automatically adjusted & verified by the system
+  // when entering select_session or while on scan_student in harian mode
+  useEffect(() => {
+    if (scanMode !== 'harian' || selectedSessionKey === 'kegiatan_lainnya') {
+      return;
+    }
+    const check = validateDailySessionSelection(selectedSessionKey, dailySessions, nowClock);
+    if (!check.allowed) {
+      setSelectedSessionKey(check.correctedSession);
+      onUpdateKioskState({ selectedSessionKey: check.correctedSession }, false);
+      if (wizardStep === 'scan_student') {
+        setLiveSessionAutoAdjustedBanner(
+          `Sistem otomatis menyesuaikan sesi aktif ke ${check.correctedLabel} sesuai waktu saat ini (${check.currentTimeStr}).`
+        );
+      }
+    }
+  }, [nowClock, dailySessions, scanMode, selectedSessionKey, wizardStep, onUpdateKioskState]);
 
   const updateStepAndPersist = (
     nextStep: KioskWizardStep,
-    extraPatch: Partial<KioskPersistedState> = {}
+    extraPatch: Partial<KioskPersistedState> = {},
+    syncToCloud = true
   ) => {
     setWizardStep(nextStep);
-    onUpdateKioskState({
-      wizardStep: nextStep === 'validation_panel' ? 'scan_student' : nextStep,
-      ...extraPatch,
-    });
+    onUpdateKioskState(
+      {
+        wizardStep: nextStep === 'validation_panel' ? 'scan_student' : nextStep,
+        ...extraPatch,
+      },
+      syncToCloud
+    );
   };
 
   const studentMap = useMemo(() => new Map(students.map((s) => [s.id, s])), [students]);
@@ -251,15 +337,9 @@ export function ScanView({
     }
     return (
       dailySessions.find((s) => s.key === selectedSessionKey) ||
-      dailySessions[0] || {
-        key: 'siang' as const,
-        label: 'Sesi Siang',
-        start_time: '12:30',
-        deadline_time: '14:30',
-        is_active: true,
-      }
+      autoSuggestedSessionConfig
     );
-  }, [dailySessions, selectedSessionKey, customDeadlineTime]);
+  }, [dailySessions, selectedSessionKey, customDeadlineTime, autoSuggestedSessionConfig]);
 
   const currentSessionTitle =
     scanMode === 'pulang'
@@ -285,12 +365,21 @@ export function ScanView({
         res.ticket.wilayah === 'putra' || res.ticket.wilayah === 'putri'
           ? res.ticket.wilayah
           : selectedWilayah;
+      const autoKey = getCurrentSuggestedSessionKey(dailySessions, new Date());
       setSelectedWilayah(nextWilayah);
+      setScanMode('harian');
+      setSelectedSessionKey(autoKey);
       playFeedback('success');
-      updateStepAndPersist('select_session', {
-        piketTicket: res.ticket,
-        selectedWilayah: nextWilayah,
-      });
+      updateStepAndPersist(
+        'select_session',
+        {
+          piketTicket: res.ticket,
+          selectedWilayah: nextWilayah,
+          scanMode: 'harian',
+          selectedSessionKey: autoKey,
+        },
+        true
+      );
     } catch (err) {
       playFeedback('error');
       setLoginError(
@@ -310,7 +399,7 @@ export function ScanView({
   };
 
   // ============================================================================
-  // STEP 2 HANDLER: CHOOSE SESSION (WITH AUTOMATIC CLOCK GUARD FOR DAILY SESSIONS)
+  // STEP 2 HANDLER: CHOOSE SESSION (AUTO-SELECTED BY SYSTEM & VERIFIED ON CLICK)
   // ============================================================================
   const enterStudentScanScreen = (
     nextMode: TransactionType,
@@ -322,11 +411,17 @@ export function ScanView({
     setManualInputCode('');
     setInlineScanError(null);
     setSessionTimeCorrectionAlert(null);
-    updateStepAndPersist('scan_student', {
-      scanMode: nextMode,
-      selectedSessionKey: nextSessionKey,
-      ...extraPatch,
-    });
+    setLiveSessionAutoAdjustedBanner(null);
+    lastVerifiedCardRef.current = { rawCode: '', studentCode: '', verifiedAtMs: 0 };
+    updateStepAndPersist(
+      'scan_student',
+      {
+        scanMode: nextMode,
+        selectedSessionKey: nextSessionKey,
+        ...extraPatch,
+      },
+      true
+    );
   };
 
   const handleChooseQuickDailySession = (key: 'siang' | 'sore' | 'malam') => {
@@ -335,6 +430,9 @@ export function ScanView({
 
     if (!check.allowed) {
       playFeedback('error');
+      // Automatically adjust selectedSessionKey to the system-verified session while displaying the explanation
+      setSelectedSessionKey(check.correctedSession);
+      onUpdateKioskState({ selectedSessionKey: check.correctedSession }, false);
       setSessionTimeCorrectionAlert({
         attemptedKey: key,
         attemptedLabel: chosenCfg?.label || `Sesi ${key}`,
@@ -386,34 +484,55 @@ export function ScanView({
   };
 
   // ============================================================================
-  // STEP 3 HANDLER:
-  // PHASE A -> SCAN KARTU SISWA (SIS-XXXX) -> KELUAR DATA SISWA & MASUK KAMERA TAS
-  // PHASE B -> SCAN BARCODE TAS (LAP-XXX) -> PANEL VALIDASI BESAR & TOMBOL OKE
+  // STEP 3 HANDLER (STRICT SEQUENTIAL SCAN):
+  // TAHAP 1 (scan_card): WAJIB KARTU SISWA (SIS-XXXX) -> KELUAR DATA SISWA
+  // TAHAP 2 (scan_bag):  WAJIB BARCODE GANTUNGAN TAS (LAP-XXX) -> VALIDASI
   // ============================================================================
-  const handleCameraOrManualScan = async (rawCode: string) => {
+  const handleCameraOrManualScan = async (rawCode: string, isFromCamera = true) => {
     const cleanCode = rawCode.trim().toUpperCase();
     if (!cleanCode || scanBusy || !piketTicket) return;
 
-    setInlineScanError(null);
-    const nowTimeStr = formatTimeOnly(new Date().toISOString());
+    const now = new Date();
+    const nowTimeStr = formatTimeOnly(now.toISOString());
 
     // -------------------------------------------------------------------------
-    // PHASE A: SCAN KARTU SISWA (SIS-XXXX ATAU KODE DARI TEMPLATE)
+    // TAHAP 1 (scan_card): WAJIB SCAN KARTU SISWA TERLEBIH DAHULU
     // -------------------------------------------------------------------------
     if (scanPhase === 'scan_card') {
-      const student = findStudentByScannedCode(cleanCode, students, laptops);
+      setInlineScanError(null);
 
-      if (!student) {
+      // 1. Check if the user accidentally scanned a Laptop Bag Tag (LAP-XXX / TAS-XXX) first!
+      const strictStudent = findStudentCardStrict(cleanCode, students);
+      const strictBag = findLaptopBagStrict(cleanCode, laptops);
+
+      const isExplicitBagPrefix = /^LAP|^TAS/i.test(cleanCode);
+      const isExactBagAssetOnly =
+        strictBag &&
+        (!strictStudent ||
+          normalizeCodeCompact(strictBag.asset_code) === normalizeCodeCompact(cleanCode));
+
+      if (isExplicitBagPrefix || (isExactBagAssetOnly && !strictStudent)) {
         playFeedback('error');
+        const bagLabel = strictBag ? `${strictBag.asset_code} (${strictBag.brand_model})` : cleanCode;
         setInlineScanError(
-          `Kode Kartu Siswa "${cleanCode}" tidak ditemukan. Pastikan data siswa sudah masuk atau men-scan Kartu Siswa (format SIS-XXXX / kode dari template).`
+          `Urutan Scan Ketat — Tahap 1 Wajib Kartu Siswa: Anda men-scan Gantungan Tas Laptop "${bagLabel}". Silakan scan KARTU SISWA (SIS-XXXX) terlebih dahulu!`
         );
         return;
       }
 
+      if (!strictStudent) {
+        playFeedback('error');
+        setInlineScanError(
+          `Kode Kartu Siswa "${cleanCode}" tidak ditemukan. Pastikan men-scan Kartu Siswa yang terdaftar (format SIS-XXXX) pada Tahap 1.`
+        );
+        return;
+      }
+
+      const student = strictStudent;
+
       if (student.wilayah !== selectedWilayah) {
         setSelectedWilayah(student.wilayah);
-        onUpdateKioskState({ selectedWilayah: student.wilayah });
+        onUpdateKioskState({ selectedWilayah: student.wilayah }, false);
       }
 
       const laptopJatah = laptopByStudentMap.get(student.id) || null;
@@ -461,18 +580,68 @@ export function ScanView({
         return;
       }
 
-      // Valid student card! Show student data & switch camera to Phase B (Scan Bag Tag)
+      // Valid student card! Record timestamp to debounce leftover camera frames & advance to Phase 2 (scan_bag)
+      lastVerifiedCardRef.current = {
+        rawCode: cleanCode,
+        studentCode: student.student_code.trim().toUpperCase(),
+        verifiedAtMs: Date.now(),
+      };
       playFeedback('scan');
       setScannedStudentId(student.id);
       setManualInputCode('');
+      setInlineScanError(null);
       setScanPhase('scan_bag');
       return;
     }
 
     // -------------------------------------------------------------------------
-    // PHASE B: SCAN BARCODE TAS LAPTOP (LAP-XXX) SETELAH DATA SISWA KELUAR
+    // TAHAP 2 (scan_bag): WAJIB SCAN BARCODE GANTUNGAN TAS LAPTOP (LAP-XXX)
     // -------------------------------------------------------------------------
     if (scanPhase === 'scan_bag' && scannedStudent) {
+      const elapsedSinceCardScan = Date.now() - lastVerifiedCardRef.current.verifiedAtMs;
+      const compactClean = normalizeCodeCompact(cleanCode);
+      const isSameCardAsStep1 =
+        cleanCode === lastVerifiedCardRef.current.rawCode ||
+        cleanCode === lastVerifiedCardRef.current.studentCode ||
+        compactClean === normalizeCodeCompact(scannedStudent.student_code);
+
+      // Ignore leftover camera frames of the Kartu Siswa for 2.5 seconds while student moves card away
+      if (isFromCamera && isSameCardAsStep1 && elapsedSinceCardScan < 2500) {
+        return;
+      }
+
+      setInlineScanError(null);
+
+      // Check if user scanned a Student Card (SIS-XXXX) instead of the Laptop Bag Tag (LAP-XXX)
+      const isExplicitStudentCardPrefix = /^SIS/i.test(cleanCode);
+      const matchedCardInStep2 = findStudentCardStrict(cleanCode, students);
+      const matchedBagInStep2 = findLaptopBagStrict(cleanCode, laptops, scannedStudent);
+
+      const isStudentCardNotBag =
+        isExplicitStudentCardPrefix ||
+        isSameCardAsStep1 ||
+        (matchedCardInStep2 &&
+          (!matchedBagInStep2 ||
+            normalizeCodeCompact(matchedCardInStep2.student_code) === compactClean));
+
+      if (isStudentCardNotBag) {
+        playFeedback('error');
+        if (matchedCardInStep2 && matchedCardInStep2.id !== scannedStudent.id) {
+          setInlineScanError(
+            `Urutan Scan Ketat: Anda men-scan Kartu Siswa lain (${matchedCardInStep2.name} · ${matchedCardInStep2.student_code}). Saat ini sistem sedang menunggu Scan BARCODE GANTUNGAN TAS (${
+              assignedLaptop?.asset_code || 'LAP-XXX'
+            }) milik ${scannedStudent.name}!`
+          );
+        } else {
+          setInlineScanError(
+            `Urutan Scan Ketat — Tahap 2 Wajib Gantungan Tas: Kartu Siswa ${scannedStudent.student_code} sudah terverifikasi. Sekarang wajib Scan BARCODE GANTUNGAN TAS LAPTOP (${
+              assignedLaptop?.asset_code || 'LAP-XXX'
+            })!`
+          );
+        }
+        return;
+      }
+
       if (
         assignedLaptop?.status === 'available' &&
         scanMode === 'harian' &&
@@ -481,29 +650,24 @@ export function ScanView({
       ) {
         playFeedback('error');
         setInlineScanError(
-          'Wajib diisi: Silakan tulis nama Kegiatan Lainnya pada kolom kegiatan siswa di atas sebelum scan tas laptop.'
+          'Wajib diisi: Silakan tulis nama Kegiatan Lainnya pada kolom kegiatan siswa di samping sebelum scan gantungan tas laptop.'
         );
         return;
       }
 
-      const scannedLaptop = findLaptopByScannedCode(
-        cleanCode,
-        laptops,
-        students,
-        scannedStudent
-      );
+      const scannedLaptop = matchedBagInStep2;
 
       if (!scannedLaptop) {
         playFeedback('error');
         setInlineScanError(
-          `Kode Barcode Tas "${cleanCode}" tidak terdaftar. Silakan scan barcode Gantungan Tas Laptop (${
+          `Kode Barcode Gantungan Tas "${cleanCode}" tidak terdaftar. Silakan scan Barcode Gantungan Tas Laptop (${
             assignedLaptop?.asset_code || 'LAP-XXX'
           }).`
         );
         return;
       }
 
-      // Ownership validation: does this bag belong to the scanned student?
+      // Strict 1-to-1 ownership validation: does this bag belong to the scanned student?
       if (scannedLaptop.assigned_student_id !== scannedStudent.id) {
         playFeedback('error');
         const realOwner = scannedLaptop.assigned_student_id
@@ -516,7 +680,7 @@ export function ScanView({
         setValidationResult({
           status: 'error',
           headline: 'SALAH TAS LAPTOP!',
-          subheadline: `Barcode tas ${scannedLaptop.asset_code} adalah milik ${ownerDesc}, BUKAN milik ${scannedStudent.name} (Jatah: ${
+          subheadline: `Barcode gantungan tas ${scannedLaptop.asset_code} adalah milik ${ownerDesc}, BUKAN milik ${scannedStudent.name} (Jatah Tas: ${
             assignedLaptop?.asset_code || '—'
           }).`,
           student: scannedStudent,
@@ -536,14 +700,36 @@ export function ScanView({
       try {
         // CASE 1: BORROWING LAPTOP
         if (scannedLaptop.status === 'available') {
+          // Ensure daily session is verified & synchronized with system clock right before borrowing
+          let effectiveSessionKey: DailySessionKey = selectedSessionKey;
+          let effectiveSessionCfg = activeDailySession;
+
+          if (scanMode === 'harian' && selectedSessionKey !== 'kegiatan_lainnya') {
+            const check = validateDailySessionSelection(selectedSessionKey, dailySessions, now);
+            if (!check.allowed) {
+              effectiveSessionKey = check.correctedSession;
+              setSelectedSessionKey(check.correctedSession);
+              onUpdateKioskState({ selectedSessionKey: check.correctedSession }, false);
+              effectiveSessionCfg =
+                dailySessions.find((s) => s.key === check.correctedSession) || activeDailySession;
+            }
+          }
+
+          const effectiveSessionTitle =
+            scanMode === 'pulang'
+              ? 'Membawa Laptop Pulang (Kepulangan)'
+              : effectiveSessionKey === 'kegiatan_lainnya'
+              ? 'Laptop Kegiatan Lainnya'
+              : effectiveSessionCfg.label;
+
           const res = await onBorrow({
             studentId: scannedStudent.id,
             laptopId: scannedLaptop.id,
             transactionType: scanMode,
-            dailySession: scanMode === 'harian' ? selectedSessionKey : undefined,
+            dailySession: scanMode === 'harian' ? effectiveSessionKey : undefined,
             customActivity: customActivityInput.trim() || undefined,
             customDeadlineTime:
-              selectedSessionKey === 'kegiatan_lainnya' ? customDeadlineTime : undefined,
+              effectiveSessionKey === 'kegiatan_lainnya' ? customDeadlineTime : undefined,
             wilayah: scannedStudent.wilayah || selectedWilayah,
             piketId: piketTicket.id,
             piketToken: piketTicket.piket_token,
@@ -555,7 +741,7 @@ export function ScanView({
             playFeedback('error');
             if (res.code === 'OUT_OF_SCHEDULE' && res.correctedSession) {
               setSelectedSessionKey(res.correctedSession);
-              onUpdateKioskState({ selectedSessionKey: res.correctedSession });
+              onUpdateKioskState({ selectedSessionKey: res.correctedSession }, false);
             }
             setValidationResult({
               status: 'error',
@@ -570,12 +756,12 @@ export function ScanView({
               laptop: scannedLaptop,
               sessionLabel: res.correctedLabel
                 ? `Dikoreksi ke ${res.correctedLabel}`
-                : currentSessionTitle,
+                : effectiveSessionTitle,
               customActivityText: customActivityInput.trim() || null,
               deadlineLabel:
                 scanMode === 'pulang'
                   ? formatDateOnly(`${plannedReturnDate}T17:00:00`)
-                  : activeDailySession.deadline_time,
+                  : effectiveSessionCfg.deadline_time,
               piketName: piketTicket.name,
               ticketNumber: piketTicket.ticket_number,
               timestamp: nowTimeStr,
@@ -590,23 +776,23 @@ export function ScanView({
             headline:
               scanMode === 'pulang'
                 ? 'VALIDASI BERHASIL — IZIN KEPULANGAN (BAWA PULANG)'
-                : selectedSessionKey === 'kegiatan_lainnya'
+                : effectiveSessionKey === 'kegiatan_lainnya'
                 ? 'VALIDASI BERHASIL — KEGIATAN LAINNYA'
-                : `VALIDASI BERHASIL — ${activeDailySession.label.toUpperCase()}`,
+                : `VALIDASI BERHASIL — ${effectiveSessionCfg.label.toUpperCase()}`,
             subheadline:
               scanMode === 'pulang'
                 ? `Status Kepulangan Aktif: ${scannedStudent.name} resmi membawa pulang ${scannedLaptop.asset_code}. Status akan otomatis berubah setelah laptop di-scan kembali.`
-                : `Kartu Siswa & Tas Laptop cocok! ${scannedStudent.name} resmi meminjam ${scannedLaptop.asset_code} (${scannedLaptop.brand_model}).`,
+                : `Urutan Kartu Siswa & Gantungan Tas cocok! ${scannedStudent.name} resmi meminjam ${scannedLaptop.asset_code} (${scannedLaptop.brand_model}).`,
             student: scannedStudent,
             laptop: scannedLaptop,
-            sessionLabel: currentSessionTitle,
+            sessionLabel: effectiveSessionTitle,
             customActivityText:
               customActivityInput.trim() ||
               (scanMode === 'pulang' ? homeNote.trim() || null : null),
             deadlineLabel:
               scanMode === 'pulang'
                 ? `Waktu Bebas · Kembali s/d ${formatDateOnly(`${plannedReturnDate}T17:00:00`)}`
-                : `Batas Jam Telat: ${activeDailySession.deadline_time}`,
+                : `Batas Jam Telat: ${effectiveSessionCfg.deadline_time}`,
             piketName: piketTicket.name,
             ticketNumber: piketTicket.ticket_number,
             timestamp: nowTimeStr,
@@ -673,7 +859,7 @@ export function ScanView({
             headline: wasKepulangan
               ? 'KEPULANGAN SELESAI — DIKEMBALIKAN TERLAMBAT'
               : `DIKEMBALIKAN TERLAMBAT (${retRes.studentLateCount}/${MAX_LATE_STRIKES})`,
-            subheadline: `Kartu & Tas cocok, namun ${scannedLaptop.asset_code} melewati batas waktu kembali (terlambat ${retRes.lateMinutes} menit).`,
+            subheadline: `Kartu & Gantungan Tas cocok, namun ${scannedLaptop.asset_code} melewati batas waktu kembali (terlambat ${retRes.lateMinutes} menit).`,
             student: scannedStudent,
             laptop: scannedLaptop,
             sessionLabel: returnedSessionLabel,
@@ -693,7 +879,7 @@ export function ScanView({
               : 'VALIDASI PENGEMBALIAN TEPAT WAKTU',
             subheadline: wasKepulangan
               ? `Laptop ${scannedLaptop.asset_code} milik ${scannedStudent.name} yang dibawa pulang kini telah di-scan kembali dan statusnya resmi berubah menjadi Tersedia di Lab.`
-              : `Kartu Siswa & Tas Laptop cocok! ${scannedLaptop.asset_code} milik ${scannedStudent.name} berhasil dikembalikan tepat waktu.`,
+              : `Urutan Kartu Siswa & Gantungan Tas cocok! ${scannedLaptop.asset_code} milik ${scannedStudent.name} berhasil dikembalikan tepat waktu.`,
             student: scannedStudent,
             laptop: scannedLaptop,
             sessionLabel: returnedSessionLabel,
@@ -718,7 +904,7 @@ export function ScanView({
     if (!manualInputCode.trim()) return;
     const code = manualInputCode;
     setManualInputCode('');
-    handleCameraOrManualScan(code);
+    handleCameraOrManualScan(code, false);
   };
 
   // Support USB / Wireless Hardware Barcode Scanners even when manual input is not focused
@@ -752,7 +938,7 @@ export function ScanView({
           if (wizardStep === 'piket_login') {
             handlePiketBarcodeLogin(scanned);
           } else if (wizardStep === 'scan_student') {
-            handleCameraOrManualScan(scanned);
+            handleCameraOrManualScan(scanned, false);
           }
         }
         return;
@@ -774,10 +960,11 @@ export function ScanView({
     setScanPhase('scan_card');
     setManualInputCode('');
     setInlineScanError(null);
+    lastVerifiedCardRef.current = { rawCode: '', studentCode: '', verifiedAtMs: 0 };
     if (selectedSessionKey === 'kegiatan_lainnya') {
       setCustomActivityInput('');
     }
-    updateStepAndPersist('scan_student');
+    updateStepAndPersist('scan_student', {}, false);
   };
 
   const handleResetToInitialGuruLogin = () => {
@@ -789,10 +976,16 @@ export function ScanView({
     setManualInputCode('');
     setInlineScanError(null);
     setSessionTimeCorrectionAlert(null);
-    updateStepAndPersist('piket_login', {
-      piketTicket: null,
-      customActivityInput: '',
-    });
+    setLiveSessionAutoAdjustedBanner(null);
+    lastVerifiedCardRef.current = { rawCode: '', studentCode: '', verifiedAtMs: 0 };
+    updateStepAndPersist(
+      'piket_login',
+      {
+        piketTicket: null,
+        customActivityInput: '',
+      },
+      true
+    );
   };
 
   return (
@@ -941,7 +1134,7 @@ export function ScanView({
                   type="button"
                   onClick={() => {
                     setSelectedWilayah('putra');
-                    onUpdateKioskState({ selectedWilayah: 'putra' });
+                    onUpdateKioskState({ selectedWilayah: 'putra' }, true);
                   }}
                   className={`min-h-[48px] rounded-xl border-2 px-4 py-2.5 text-xs font-extrabold transition-all sm:text-sm ${
                     selectedWilayah === 'putra'
@@ -955,7 +1148,7 @@ export function ScanView({
                   type="button"
                   onClick={() => {
                     setSelectedWilayah('putri');
-                    onUpdateKioskState({ selectedWilayah: 'putri' });
+                    onUpdateKioskState({ selectedWilayah: 'putri' }, true);
                   }}
                   className={`min-h-[48px] rounded-xl border-2 px-4 py-2.5 text-xs font-extrabold transition-all sm:text-sm ${
                     selectedWilayah === 'putri'
@@ -964,6 +1157,47 @@ export function ScanView({
                   }`}
                 >
                   Wilayah Putri
+                </button>
+              </div>
+            </div>
+
+            {/* Banner Sesi Otomatis Dipilih & Dipastikan Sistem */}
+            <div className="rounded-2xl border-2 border-emerald-500 bg-emerald-50/90 p-4 shadow-xs">
+              <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-600 text-white">
+                    <Sparkles className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-md bg-emerald-700 px-2 py-0.5 text-[10px] font-extrabold text-white uppercase">
+                        Otomatis Dipilih &amp; Dipastikan Sistem
+                      </span>
+                      <span className="font-mono text-xs font-extrabold text-emerald-950">
+                        Jam Sekarang:{' '}
+                        {nowClock.toLocaleTimeString('id-ID', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs font-bold text-emerald-950 sm:text-sm">
+                      Sesi Aktif Otomatis: <span className="underline">{autoSuggestedSessionConfig.label}</span>{' '}
+                      (Mulai {autoSuggestedSessionConfig.start_time} · Batas Kembali{' '}
+                      {autoSuggestedSessionConfig.deadline_time})
+                    </p>
+                    <p className="mt-0.5 text-[11px] font-semibold text-emerald-800">
+                      Sesi sudah disesuaikan otomatis oleh sistem, namun Guru Piket tetap dapat memilih kartu sesi di bawah.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleChooseQuickDailySession(autoSuggestedSessionKey)}
+                  className="inline-flex min-h-[44px] shrink-0 items-center justify-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-xs font-extrabold text-white shadow-xs hover:bg-emerald-800"
+                >
+                  <CheckCircle2 className="h-4 w-4 text-amber-300" />
+                  Lanjut {autoSuggestedSessionConfig.label}
                 </button>
               </div>
             </div>
@@ -1013,13 +1247,11 @@ export function ScanView({
             <div>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <label className="text-xs font-extrabold text-slate-700 uppercase">
-                  2. Pilih Sesi Harian (Sistem Menahan &amp; Mengoreksi Otomatis Jika Jam Tidak Sesuai)
+                  2. Pilih Sesi Harian (Tetap Bisa Dipilih &amp; Dipastikan Sesuai Jam Sistem)
                 </label>
                 <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-700">
                   <Clock className="h-3.5 w-3.5" />
-                  Sesi Sesuai Jam Saat Ini:{' '}
-                  {dailySessions.find((s) => s.key === getCurrentSuggestedSessionKey())?.label ||
-                    'Sesi Harian'}
+                  Sesi Otomatis Saat Ini: {autoSuggestedSessionConfig.label}
                 </span>
               </div>
               <div className="mt-2.5 grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -1029,21 +1261,25 @@ export function ScanView({
                   const checkNow = validateDailySessionSelection(
                     sess.key,
                     dailySessions,
-                    new Date()
+                    nowClock
                   );
-                  const cardColor =
-                    sess.key === 'siang'
-                      ? 'border-amber-300 bg-amber-50/70 hover:bg-amber-100 text-amber-950'
-                      : sess.key === 'sore'
-                      ? 'border-emerald-300 bg-emerald-50/70 hover:bg-emerald-100 text-emerald-950'
-                      : 'border-indigo-300 bg-indigo-50/70 hover:bg-indigo-100 text-indigo-950';
+                  const isAutoSelected =
+                    sess.key === autoSuggestedSessionKey ||
+                    (selectedSessionKey === sess.key && checkNow.allowed);
+                  const cardColor = isAutoSelected
+                    ? 'border-emerald-600 ring-2 ring-emerald-500/30 bg-emerald-50/90 hover:bg-emerald-100 text-emerald-950 shadow-sm'
+                    : sess.key === 'siang'
+                    ? 'border-amber-300 bg-amber-50/70 hover:bg-amber-100 text-amber-950'
+                    : sess.key === 'sore'
+                    ? 'border-emerald-300 bg-emerald-50/70 hover:bg-emerald-100 text-emerald-950'
+                    : 'border-indigo-300 bg-indigo-50/70 hover:bg-indigo-100 text-indigo-950';
 
                   return (
                     <button
                       key={sess.key}
                       type="button"
                       onClick={() => handleChooseQuickDailySession(sess.key)}
-                      className={`flex min-h-[108px] flex-col justify-between rounded-2xl border-2 p-4 text-left transition-all ${cardColor}`}
+                      className={`flex min-h-[118px] flex-col justify-between rounded-2xl border-2 p-4 text-left transition-all ${cardColor}`}
                     >
                       <div className="flex items-center justify-between">
                         <span className="text-sm font-extrabold">{sess.label}</span>
@@ -1063,7 +1299,11 @@ export function ScanView({
                               : 'bg-slate-200 text-slate-700'
                           }`}
                         >
-                          {checkNow.allowed ? 'SESUAI JAM SEKARANG' : 'DITAHAN DI LUAR JAM'}
+                          {checkNow.allowed
+                            ? isAutoSelected
+                              ? '✓ OTOMATIS DIPILIH SISTEM'
+                              : 'SESUAI JAM SEKARANG'
+                            : 'DITAHAN DI LUAR JAM'}
                         </span>
                       </div>
                     </button>
@@ -1093,7 +1333,9 @@ export function ScanView({
                     value={customActivityInput}
                     onChange={(e) => {
                       setCustomActivityInput(e.target.value);
-                      onUpdateKioskState({ customActivityInput: e.target.value });
+                    }}
+                    onBlur={() => {
+                      onUpdateKioskState({ customActivityInput }, false);
                     }}
                     placeholder="Contoh: Lomba Karya Ilmiah / Tugas Kelompok"
                     className="min-h-[46px] w-full rounded-xl border border-cyan-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-900 outline-none focus:border-cyan-700"
@@ -1108,7 +1350,7 @@ export function ScanView({
                     value={customDeadlineTime}
                     onChange={(e) => {
                       setCustomDeadlineTime(e.target.value);
-                      onUpdateKioskState({ customDeadlineTime: e.target.value });
+                      onUpdateKioskState({ customDeadlineTime: e.target.value }, false);
                     }}
                     className="min-h-[46px] w-full rounded-xl border border-cyan-300 bg-white px-2.5 py-2 font-mono text-xs font-bold text-slate-900 outline-none focus:border-cyan-700"
                   />
@@ -1154,7 +1396,7 @@ export function ScanView({
                     min={getDefaultReturnDateInput(0)}
                     onChange={(e) => {
                       setPlannedReturnDate(e.target.value);
-                      onUpdateKioskState({ plannedReturnDate: e.target.value });
+                      onUpdateKioskState({ plannedReturnDate: e.target.value }, false);
                     }}
                     className="min-h-[46px] w-full rounded-xl border border-violet-300 bg-white px-3 py-2 font-mono text-xs font-bold text-slate-900 outline-none focus:border-violet-700"
                   />
@@ -1168,7 +1410,9 @@ export function ScanView({
                     value={homeNote}
                     onChange={(e) => {
                       setHomeNote(e.target.value);
-                      onUpdateKioskState({ homeNote: e.target.value });
+                    }}
+                    onBlur={() => {
+                      onUpdateKioskState({ homeNote }, false);
                     }}
                     placeholder="Contoh: Pulang akhir pekan · Dijemput Ayah"
                     className="min-h-[46px] w-full rounded-xl border border-violet-300 bg-white px-3 py-2 text-xs font-semibold text-slate-900 outline-none focus:border-violet-700"
@@ -1221,7 +1465,7 @@ export function ScanView({
 
               <button
                 type="button"
-                onClick={() => updateStepAndPersist('select_session')}
+                onClick={() => updateStepAndPersist('select_session', {}, false)}
                 className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-3.5 py-2 text-xs font-bold text-white hover:bg-white/20"
               >
                 <ArrowLeft className="h-3.5 w-3.5" />
@@ -1231,6 +1475,66 @@ export function ScanView({
           </div>
 
           <div className="space-y-5 p-5 sm:p-7">
+            {/* Live Auto-Adjusted Session Notice */}
+            {liveSessionAutoAdjustedBanner && (
+              <div className="flex items-center justify-between gap-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs font-bold text-amber-950">
+                <div className="flex items-center gap-2.5">
+                  <Sparkles className="h-4 w-4 shrink-0 text-amber-600" />
+                  <span>{liveSessionAutoAdjustedBanner}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setLiveSessionAutoAdjustedBanner(null)}
+                  className="rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-[11px] font-extrabold text-amber-900 hover:bg-amber-100"
+                >
+                  Mengerti
+                </button>
+              </div>
+            )}
+
+            {/* 2-Step Strict Sequence Progress Bar: 1. Kartu Siswa -> 2. Gantungan Tas */}
+            <div className="grid grid-cols-2 gap-2.5 rounded-2xl border border-slate-200 bg-slate-50 p-2">
+              <div
+                className={`flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 transition-all ${
+                  scanPhase === 'scan_card'
+                    ? 'bg-blue-700 text-white shadow-xs'
+                    : 'bg-emerald-600 text-white'
+                }`}
+              >
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-white/20 font-mono text-xs font-extrabold">
+                  {scanPhase === 'scan_card' ? '1' : '✓'}
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-[10px] font-extrabold tracking-wider uppercase opacity-90">
+                    Langkah 1 (Wajib Pertama)
+                  </p>
+                  <p className="truncate text-xs font-extrabold">
+                    Scan Kartu Siswa (SIS-XXXX)
+                  </p>
+                </div>
+              </div>
+
+              <div
+                className={`flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 transition-all ${
+                  scanPhase === 'scan_bag'
+                    ? 'bg-indigo-700 text-white shadow-xs'
+                    : 'bg-slate-200/80 text-slate-500'
+                }`}
+              >
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-white/20 font-mono text-xs font-extrabold">
+                  2
+                </span>
+                <div className="min-w-0">
+                  <p className="truncate text-[10px] font-extrabold tracking-wider uppercase opacity-90">
+                    Langkah 2 (Setelah Kartu)
+                  </p>
+                  <p className="truncate text-xs font-extrabold">
+                    Scan Gantungan Tas ({assignedLaptop ? assignedLaptop.asset_code : 'LAP-XXX'})
+                  </p>
+                </div>
+              </div>
+            </div>
+
             {/* Single Sequential Scan Indicator: Scan 1 (Kartu Siswa) -> Scan 2 (Gantungan Tas) */}
             {scanPhase === 'scan_card' ? (
               <div className="flex items-center justify-between rounded-2xl border-2 border-blue-600 bg-blue-50 px-4 py-3.5 text-blue-950 shadow-xs">
@@ -1240,10 +1544,10 @@ export function ScanView({
                   </div>
                   <div>
                     <p className="text-[11px] font-extrabold tracking-wider text-blue-700 uppercase">
-                      Scan Pertama · Kartu Siswa
+                      Urutan 1 dari 2 · Kartu Siswa Terlebih Dahulu
                     </p>
                     <p className="text-xs font-extrabold sm:text-sm">
-                      Silakan Scan QR / Barcode Kartu Siswa (SIS-XXXX)
+                      Silakan Scan QR / Barcode Kartu Siswa (SIS-XXXX). Gantungan Tas ditolak sebelum Kartu Siswa di-scan.
                     </p>
                   </div>
                 </div>
@@ -1260,10 +1564,10 @@ export function ScanView({
                   <div>
                     <p className="flex items-center gap-1.5 text-[11px] font-extrabold tracking-wider text-emerald-700 uppercase">
                       <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-                      Scan Pertama Selesai · Lanjut Scan Kedua (Gantungan Tas)
+                      Urutan 2 dari 2 · Kartu Siswa Terverifikasi · Lanjut Scan Gantungan Tas
                     </p>
                     <p className="text-xs font-extrabold sm:text-sm">
-                      Sekarang Scan Barcode Gantungan Tas Laptop ({assignedLaptop ? assignedLaptop.asset_code : 'LAP-XXX'})
+                      Sekarang Scan Barcode Gantungan Tas Laptop ({assignedLaptop ? assignedLaptop.asset_code : 'LAP-XXX'}) milik {scannedStudent?.name}
                     </p>
                   </div>
                 </div>
@@ -1273,11 +1577,12 @@ export function ScanView({
                     setScannedStudentId(null);
                     setScanPhase('scan_card');
                     setInlineScanError(null);
+                    lastVerifiedCardRef.current = { rawCode: '', studentCode: '', verifiedAtMs: 0 };
                   }}
                   className="inline-flex items-center gap-1.5 rounded-xl bg-rose-100 px-3 py-1.5 text-xs font-extrabold text-rose-700 transition-colors hover:bg-rose-200"
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
-                  Ulang Scan Kartu
+                  Ganti / Ulang Kartu Siswa
                 </button>
               </div>
             )}
@@ -1345,7 +1650,7 @@ export function ScanView({
                   {/* Paired Laptop Bag Tag Info to Scan Next */}
                   <div className="rounded-xl border border-emerald-200 bg-white p-3.5">
                     <p className="text-[11px] font-bold text-slate-500 uppercase">
-                      Lanjutkan Scan Barcode Tas Laptop Ini:
+                      Lanjutkan Scan Barcode Gantungan Tas Ini:
                     </p>
                     <div className="mt-1 flex items-center justify-between">
                       <span className="font-mono text-lg font-extrabold text-slate-900">
@@ -1388,7 +1693,9 @@ export function ScanView({
                         value={customActivityInput}
                         onChange={(e) => {
                           setCustomActivityInput(e.target.value);
-                          onUpdateKioskState({ customActivityInput: e.target.value });
+                        }}
+                        onBlur={() => {
+                          onUpdateKioskState({ customActivityInput }, false);
                         }}
                         placeholder="Ketik nama kegiatan siswa..."
                         className="mt-1.5 min-h-[42px] w-full rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-bold text-slate-900 outline-none focus:border-blue-600"
@@ -1410,8 +1717,8 @@ export function ScanView({
                   <p className="flex items-center justify-center gap-2 text-xs font-extrabold sm:text-sm">
                     <ScanLine className="h-4 w-4 text-amber-300" />
                     {scanPhase === 'scan_card'
-                      ? `Arahkan Kamera ke Kartu Siswa (${WILAYAH_LABELS[selectedWilayah]})`
-                      : `Sekarang Arahkan Kamera ke Barcode Tas Laptop (${
+                      ? `1. Arahkan Kamera ke Kartu Siswa (${WILAYAH_LABELS[selectedWilayah]})`
+                      : `2. Sekarang Arahkan Kamera ke Gantungan Tas Laptop (${
                           assignedLaptop?.asset_code || 'LAP-XXX'
                         })`}
                   </p>
@@ -1437,8 +1744,8 @@ export function ScanView({
                       }}
                       placeholder={
                         scanPhase === 'scan_card'
-                          ? 'Scan / ketik kode Kartu Siswa (cth: SIS-0001)...'
-                          : `Scan / ketik kode Barcode Tas (${
+                          ? 'Langkah 1: Scan / ketik kode Kartu Siswa (cth: SIS-0001)...'
+                          : `Langkah 2: Scan / ketik kode Gantungan Tas (${
                               assignedLaptop?.asset_code || 'LAP-001'
                             })...`
                       }
@@ -1453,8 +1760,8 @@ export function ScanView({
                     {scanBusy
                       ? 'Memproses...'
                       : scanPhase === 'scan_card'
-                      ? 'Verifikasi Kartu'
-                      : 'Verifikasi Tas'}
+                      ? 'Verifikasi Kartu (1/2)'
+                      : 'Verifikasi Tas (2/2)'}
                   </button>
                 </form>
 
