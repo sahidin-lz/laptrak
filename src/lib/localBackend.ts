@@ -23,7 +23,12 @@ import {
   Wilayah,
 } from '../types/models';
 import { ApiError, AuthStatusResponse, BorrowPayload, LoginResponse } from './api';
-import { validateDailySessionSelection } from './store';
+import {
+  extractPrefixAndNumber,
+  findStudentByScannedCode,
+  normalizeCodeCompact,
+  validateDailySessionSelection,
+} from './store';
 
 const LOCAL_DB_KEY = 'laptrack_serverless_db_v1';
 const LOCAL_SESSION_KEY = 'laptrack_serverless_auth_user_v1';
@@ -539,14 +544,78 @@ function refreshExpiredSuspensions(students: Student[]): void {
   }
 }
 
+function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
+  const assignedStudentIds = new Set(
+    db.laptops.map((l) => l.assigned_student_id).filter(Boolean) as string[]
+  );
+  const nowIso = new Date().toISOString();
+
+  for (const st of db.students) {
+    if (assignedStudentIds.has(st.id)) continue;
+
+    // 1. Check if there is a laptop with the same sequence number (e.g. SIS-0007 -> LAP-007) that is unassigned
+    const parsedStu = extractPrefixAndNumber(st.student_code);
+    const desiredLapCode =
+      parsedStu.num !== null
+        ? `LAP-${String(parsedStu.num).padStart(3, '0')}`
+        : `LAP-${st.student_code.replace(/^SIS[-_]?/i, '')}`;
+
+    const matchingUnassigned = db.laptops.find(
+      (l) =>
+        !l.assigned_student_id &&
+        (l.asset_code.toUpperCase() === desiredLapCode.toUpperCase() ||
+          (parsedStu.num !== null &&
+            extractPrefixAndNumber(l.asset_code).num === parsedStu.num))
+    );
+
+    if (matchingUnassigned) {
+      matchingUnassigned.assigned_student_id = st.id;
+      assignedStudentIds.add(st.id);
+      continue;
+    }
+
+    // 2. If desiredLapCode does not exist at all, create it automatically for this student
+    if (!db.laptops.some((l) => l.asset_code.toUpperCase() === desiredLapCode.toUpperCase())) {
+      db.laptops.push({
+        id: makeId('lap'),
+        asset_code: desiredLapCode.toUpperCase(),
+        brand_model: 'Laptop Sekolah',
+        status: 'available',
+        assigned_student_id: st.id,
+        created_at: nowIso,
+      });
+      assignedStudentIds.add(st.id);
+      continue;
+    }
+
+    // 3. Otherwise generate next available LAP-XXX code
+    let nextNum = Math.max(db.laptops.length + 1, parsedStu.num || 1);
+    while (
+      db.laptops.some(
+        (l) => l.asset_code.toUpperCase() === `LAP-${String(nextNum).padStart(3, '0')}`
+      )
+    ) {
+      nextNum++;
+    }
+    db.laptops.push({
+      id: makeId('lap'),
+      asset_code: `LAP-${String(nextNum).padStart(3, '0')}`,
+      brand_model: 'Laptop Sekolah',
+      status: 'available',
+      assigned_student_id: st.id,
+      created_at: nowIso,
+    });
+    assignedStudentIds.add(st.id);
+  }
+}
+
 function buildAppState(): AppStatePayload {
   refreshExpiredSuspensions(localDb.students);
-  const currentUser = getSavedAuthUser();
-  const isAdmin = currentUser?.role === 'admin';
+  ensureStudentsHaveLaptopAllocation(localDb);
 
-  const safeStaff: StaffMember[] = isAdmin
-    ? localDb.staff.map(({ passwordPlain: _ignored, ...rest }) => rest)
-    : [];
+  const safeStaff: StaffMember[] = localDb.staff.map(
+    ({ passwordPlain: _ignored, ...rest }) => rest
+  );
 
   const piketOptions: PiketOption[] = localDb.staff
     .filter((s) => s.is_active)
@@ -699,21 +768,84 @@ export const localBackend = {
   getState: async (): Promise<AppStatePayload> => buildAppState(),
 
   hydrateState: async (bundle: Partial<AppStatePayload>): Promise<AppStatePayload> => {
+    // Non-destructively merge students so locally uploaded template rows are never lost
     if (Array.isArray(bundle.students) && bundle.students.length > 0) {
-      localDb.students = bundle.students;
-      localDb.studentSeq = Math.max(localDb.studentSeq, bundle.students.length + 1);
+      const mergedStudents = [...localDb.students];
+      for (const incoming of bundle.students) {
+        const idx = mergedStudents.findIndex(
+          (s) =>
+            s.id === incoming.id ||
+            s.student_code.toUpperCase() === incoming.student_code.toUpperCase()
+        );
+        if (idx !== -1) {
+          mergedStudents[idx] = { ...mergedStudents[idx], ...incoming };
+        } else {
+          mergedStudents.push(incoming);
+        }
+      }
+      localDb.students = mergedStudents;
+      localDb.studentSeq = Math.max(localDb.studentSeq, localDb.students.length + 1);
     }
+
+    // Non-destructively merge laptops
     if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
-      localDb.laptops = bundle.laptops;
+      const mergedLaptops = [...localDb.laptops];
+      for (const incoming of bundle.laptops) {
+        const idx = mergedLaptops.findIndex(
+          (l) =>
+            l.id === incoming.id ||
+            l.asset_code.toUpperCase() === incoming.asset_code.toUpperCase()
+        );
+        if (idx !== -1) {
+          mergedLaptops[idx] = { ...mergedLaptops[idx], ...incoming };
+        } else {
+          mergedLaptops.push(incoming);
+        }
+      }
+      localDb.laptops = mergedLaptops;
     }
+
+    // Non-destructively merge staff / Guru Piket tokens
+    if (Array.isArray(bundle.staff) && bundle.staff.length > 0) {
+      for (const incoming of bundle.staff) {
+        const existing = localDb.staff.find(
+          (s) =>
+            s.id === incoming.id ||
+            s.username.toLowerCase() === incoming.username.toLowerCase() ||
+            s.piket_token.toUpperCase() === incoming.piket_token.toUpperCase()
+        );
+        if (existing) {
+          existing.name = incoming.name;
+          existing.piket_token = incoming.piket_token;
+          existing.wilayah = incoming.wilayah;
+          existing.role = incoming.role;
+          existing.is_active = incoming.is_active;
+        } else {
+          localDb.staff.push({
+            ...incoming,
+            passwordPlain: '121320',
+          });
+        }
+      }
+    }
+
     if (Array.isArray(bundle.schedules) && bundle.schedules.length > 0) {
       localDb.schedules = bundle.schedules;
     }
     if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
       localDb.dailySessions = bundle.dailySessions;
     }
-    if (Array.isArray(bundle.transactions)) {
-      localDb.transactions = bundle.transactions;
+    if (Array.isArray(bundle.transactions) && bundle.transactions.length > 0) {
+      const mergedTx = [...localDb.transactions];
+      for (const incoming of bundle.transactions) {
+        const idx = mergedTx.findIndex((t) => t.id === incoming.id);
+        if (idx !== -1) {
+          mergedTx[idx] = incoming;
+        } else {
+          mergedTx.push(incoming);
+        }
+      }
+      localDb.transactions = mergedTx;
     }
     if (bundle.printSettings) {
       localDb.printSettings = { ...localDb.printSettings, ...bundle.printSettings };
@@ -795,15 +927,34 @@ export const localBackend = {
     barcode: string
   ): Promise<{ ok: boolean; ticket: PiketTicket; kioskState: KioskPersistedState }> => {
     const rawBarcode = (barcode || '').trim().toUpperCase();
-    const cleaned = rawBarcode.replace(/^(GURU|PIKET|TOKEN|BARCODE)[:\-]/i, '').trim();
+    const cleaned = rawBarcode.replace(/^(GURU|PIKET|TOKEN|BARCODE)[:\-\s]*/i, '').trim();
+    const compactCleaned = normalizeCodeCompact(cleaned);
+    const parsedScan = extractPrefixAndNumber(cleaned);
 
-    const matched = localDb.staff.find(
-      (s) =>
-        s.is_active &&
-        (s.piket_token.toUpperCase() === cleaned ||
-          s.piket_token.toUpperCase() === rawBarcode ||
-          s.username.toUpperCase() === cleaned)
-    );
+    const matched = localDb.staff.find((s) => {
+      if (!s.is_active) return false;
+      const tokenUpper = s.piket_token.trim().toUpperCase();
+      const userUpper = s.username.trim().toUpperCase();
+      const nameUpper = s.name.trim().toUpperCase();
+      if (
+        tokenUpper === cleaned ||
+        tokenUpper === rawBarcode ||
+        normalizeCodeCompact(tokenUpper) === compactCleaned ||
+        userUpper === cleaned ||
+        normalizeCodeCompact(userUpper) === compactCleaned ||
+        nameUpper === cleaned ||
+        normalizeCodeCompact(nameUpper) === compactCleaned
+      ) {
+        return true;
+      }
+      if (parsedScan.num !== null) {
+        const sp = extractPrefixAndNumber(tokenUpper);
+        if (sp.num !== null && sp.num === parsedScan.num) {
+          return true;
+        }
+      }
+      return false;
+    });
 
     if (!matched) {
       throw new ApiError(
@@ -1111,6 +1262,7 @@ export const localBackend = {
 
   bulkAddStudents: async (
     rows: Array<{
+      student_code?: string;
       name: string;
       class: string;
       wilayah?: Wilayah;
@@ -1124,29 +1276,76 @@ export const localBackend = {
     const nowIso = new Date().toISOString();
 
     for (const raw of rows) {
-      if (!raw.name?.trim() || !raw.class?.trim()) continue;
-      const student: Student = {
-        id: makeId('stu'),
-        student_code: formatStudentCode(localDb.studentSeq++),
-        name: raw.name.trim(),
-        class: raw.class.trim(),
-        wilayah: normalizeWilayah(raw.wilayah, 'putra'),
-        photo_url: raw.photo_url || null,
-        late_count: 0,
-        is_suspended: false,
-        suspended_until: null,
-        suspended_reason: null,
-        created_at: nowIso,
-      };
-      localDb.students.push(student);
-      createdStudents++;
+      if (!raw.name?.trim()) continue;
+      const cleanName = raw.name.trim();
+      const cleanClass = (raw.class || '10').trim();
+      const cleanWilayah = normalizeWilayah(raw.wilayah, 'putra');
+      const customCode = raw.student_code?.trim().toUpperCase();
 
-      if (raw.laptop_code?.trim()) {
-        const code = raw.laptop_code.trim().toUpperCase();
-        if (!localDb.laptops.some((l) => l.asset_code.toUpperCase() === code)) {
+      // Check if student already exists by student_code or exact name
+      let student = localDb.students.find(
+        (s) =>
+          (customCode && s.student_code.toUpperCase() === customCode) ||
+          (s.name.trim().toLowerCase() === cleanName.toLowerCase() &&
+            s.class.trim().toLowerCase() === cleanClass.toLowerCase())
+      );
+
+      if (student) {
+        student.name = cleanName;
+        student.class = cleanClass;
+        student.wilayah = cleanWilayah;
+        if (customCode) student.student_code = customCode;
+        if (raw.photo_url) student.photo_url = raw.photo_url;
+        createdStudents++;
+      } else {
+        const nextCode = customCode || formatStudentCode(localDb.studentSeq++);
+        student = {
+          id: makeId('stu'),
+          student_code: nextCode,
+          name: cleanName,
+          class: cleanClass,
+          wilayah: cleanWilayah,
+          photo_url: raw.photo_url || null,
+          late_count: 0,
+          is_suspended: false,
+          suspended_until: null,
+          suspended_reason: null,
+          created_at: nowIso,
+        };
+        localDb.students.push(student);
+        createdStudents++;
+      }
+
+      // Link or create laptop for this student
+      const desiredLaptopCode = raw.laptop_code?.trim().toUpperCase();
+      if (desiredLaptopCode) {
+        // Clear any other laptop currently assigned to this student
+        for (const l of localDb.laptops) {
+          if (
+            l.assigned_student_id === student.id &&
+            normalizeCodeCompact(l.asset_code) !== normalizeCodeCompact(desiredLaptopCode)
+          ) {
+            l.assigned_student_id = null;
+          }
+        }
+
+        const existingLaptop = localDb.laptops.find(
+          (l) =>
+            l.asset_code.toUpperCase() === desiredLaptopCode ||
+            normalizeCodeCompact(l.asset_code) === normalizeCodeCompact(desiredLaptopCode)
+        );
+
+        if (existingLaptop) {
+          existingLaptop.asset_code = desiredLaptopCode;
+          if (raw.laptop_brand?.trim()) {
+            existingLaptop.brand_model = raw.laptop_brand.trim();
+          }
+          existingLaptop.assigned_student_id = student.id;
+          createdLaptops++;
+        } else {
           localDb.laptops.push({
             id: makeId('lap'),
-            asset_code: code,
+            asset_code: desiredLaptopCode,
             brand_model: raw.laptop_brand?.trim() || 'Laptop Sekolah',
             status: 'available',
             assigned_student_id: student.id,
@@ -1268,17 +1467,50 @@ export const localBackend = {
     for (const raw of rows) {
       const code = (raw.asset_code || '').trim().toUpperCase();
       if (!code) continue;
-      let matchedStudent: Student | undefined;
+      let matchedStudent: Student | null = null;
       if (raw.student_code?.trim()) {
         const ref = raw.student_code.trim();
-        matchedStudent = localDb.students.find(
-          (s) =>
-            s.student_code.toUpperCase() === ref.toUpperCase() ||
-            s.name.toLowerCase() === ref.toLowerCase()
-        );
+        matchedStudent = findStudentByScannedCode(ref, localDb.students, localDb.laptops);
+
+        // If ref looks like a student name that isn't registered yet, auto-create the student!
+        if (!matchedStudent && !/^SIS[-_]?\d+$/i.test(ref) && ref.length >= 2) {
+          const newStu: Student = {
+            id: makeId('stu'),
+            student_code: formatStudentCode(localDb.studentSeq++),
+            name: ref,
+            class: '10',
+            wilayah: 'putra',
+            photo_url: null,
+            late_count: 0,
+            is_suspended: false,
+            suspended_until: null,
+            suspended_reason: null,
+            created_at: nowIso,
+          };
+          localDb.students.push(newStu);
+          matchedStudent = newStu;
+        }
       }
-      const existing = localDb.laptops.find((l) => l.asset_code.toUpperCase() === code);
+
+      if (matchedStudent) {
+        // Ensure 1-to-1 relation by detaching any different laptop previously assigned to this student
+        for (const l of localDb.laptops) {
+          if (
+            l.assigned_student_id === matchedStudent.id &&
+            normalizeCodeCompact(l.asset_code) !== normalizeCodeCompact(code)
+          ) {
+            l.assigned_student_id = null;
+          }
+        }
+      }
+
+      const existing = localDb.laptops.find(
+        (l) =>
+          l.asset_code.toUpperCase() === code ||
+          normalizeCodeCompact(l.asset_code) === normalizeCodeCompact(code)
+      );
       if (existing) {
+        existing.asset_code = code;
         existing.brand_model = raw.brand_model?.trim() || existing.brand_model;
         if (matchedStudent) existing.assigned_student_id = matchedStudent.id;
         updatedLaptops++;

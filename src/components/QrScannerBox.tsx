@@ -80,8 +80,17 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
           Html5QrcodeSupportedFormats.QR_CODE,
           Html5QrcodeSupportedFormats.CODE_128,
           Html5QrcodeSupportedFormats.CODE_39,
+          Html5QrcodeSupportedFormats.CODE_93,
+          Html5QrcodeSupportedFormats.CODABAR,
           Html5QrcodeSupportedFormats.EAN_13,
+          Html5QrcodeSupportedFormats.EAN_8,
+          Html5QrcodeSupportedFormats.ITF,
+          Html5QrcodeSupportedFormats.UPC_A,
+          Html5QrcodeSupportedFormats.UPC_E,
         ],
+        experimentalFeatures: {
+          useBarCodeDetectorIfSupported: true,
+        },
         verbose: false,
       });
       scannerRef.current = scanner;
@@ -89,9 +98,11 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
       await scanner.start(
         { facingMode: 'environment' },
         {
-          fps: 10,
-          qrbox: { width: 240, height: 180 },
-          aspectRatio: 1.333,
+          fps: 15,
+          qrbox: (viewfinderWidth: number, viewfinderHeight: number) => ({
+            width: Math.max(200, Math.floor(viewfinderWidth * 0.88)),
+            height: Math.max(120, Math.floor(viewfinderHeight * 0.65)),
+          }),
         },
         (decodedText) => {
           if (pausedRef.current) return;
@@ -99,7 +110,7 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
           const cleaned = decodedText.trim().toUpperCase();
           if (
             cleaned === lastScanRef.current.text &&
-            now - lastScanRef.current.time < 2200
+            now - lastScanRef.current.time < 1200
           ) {
             return;
           }

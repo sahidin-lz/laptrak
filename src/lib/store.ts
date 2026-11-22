@@ -3,6 +3,7 @@ import {
   DailySessionConfig,
   DailySessionKey,
   DAYS_ID,
+  Laptop,
   LaptopPurpose,
   MAX_LATE_STRIKES,
   Schedule,
@@ -202,6 +203,7 @@ export function validateDailySessionSelection(
 }
 
 export interface ParsedStudentLaptopRow {
+  student_code?: string;
   name: string;
   class: string;
   wilayah: Wilayah;
@@ -388,90 +390,249 @@ function parseStaffWilayahCol(raw: string | undefined): StaffWilayah {
 }
 
 /**
- * Parse Student + Laptop CSV/Excel template:
- * Kolom: nama | kelas | wilayah | kode_laptop | merk_laptop | photo_url
+ * Header-aware & fallback parser for Student + Laptop CSV/Excel template.
+ * Supports optional `no`, `kode_siswa`, and any column ordering:
+ * e.g. nama | kelas | wilayah | kode_laptop | merk_laptop | photo_url
+ * or kode_siswa | nama | kelas | wilayah | kode_laptop | merk_laptop
  */
 export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
   const lines = normalizeCsvLines(text);
-  if (lines.length <= 1) return [];
+  if (lines.length === 0) return [];
 
-  const headerLine = lines[0].toLowerCase();
-  const hasWilayah = headerLine.includes('wilayah');
-  const hasLaptop = headerLine.includes('kode_laptop') || headerLine.includes('kode laptop');
+  const firstRowCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase().trim());
+  const isHeaderRow = firstRowCols.some((c) =>
+    /^(no|nomor|nama|name|siswa|murid|kelas|class|wilayah|kode_siswa|student_code|nis|kode_laptop|asset_code|merk_laptop)$/.test(
+      c.replace(/\s+/g, '_')
+    ) ||
+    c.includes('nama') ||
+    c.includes('kelas') ||
+    c.includes('laptop')
+  );
 
-  return lines
-    .slice(1)
+  const dataLines = isHeaderRow ? lines.slice(1) : lines;
+
+  // Map column indices dynamically from header if present
+  const findColIdx = (patterns: RegExp[]): number => {
+    if (!isHeaderRow) return -1;
+    for (const pat of patterns) {
+      const idx = firstRowCols.findIndex((h) => pat.test(h.replace(/\s+/g, '_')));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  const idxStudentCode = findColIdx([
+    /^(kode_siswa|student_code|kode_kartu|barcode_siswa|barcode_kartu|nis|nisn|id_siswa)$/,
+  ]);
+  const idxName = findColIdx([/^(nama|nama_siswa|nama_lengkap|name|siswa|murid)$/, /nama/]);
+  const idxClass = findColIdx([/^(kelas|class|rombel|tingkat)$/, /kelas/]);
+  const idxWilayah = findColIdx([/^(wilayah|asrama|gender|jk|jenis_kelamin|putra_putri)$/, /wilayah/]);
+  const idxLaptopCode = findColIdx([
+    /^(kode_laptop|asset_code|barcode_tas|kode_tas|barcode_laptop|kode_barcode|nomor_laptop)$/,
+    /kode.*laptop|barcode.*tas/,
+  ]);
+  const idxLaptopBrand = findColIdx([
+    /^(merk_laptop|merk|brand|brand_model|tipe_laptop|model_laptop)$/,
+    /merk|brand/,
+  ]);
+  const idxPhoto = findColIdx([/^(photo_url|foto|photo|url_foto)$/]);
+
+  return dataLines
     .map((line) => {
-      const cols = splitCsvLine(line);
+      let cols = splitCsvLine(line);
+      // If there's no header row and column 0 is just a row number (1, 2, 3), shift it off
+      if (!isHeaderRow && cols.length >= 4 && /^\d{1,3}$/.test(cols[0])) {
+        cols = cols.slice(1);
+      }
 
-      if (hasWilayah && hasLaptop) {
-        const [nama, kelas, wilayah, kodeLaptop, merkLaptop, foto] = cols;
+      if (isHeaderRow && idxName !== -1) {
+        const nama = (cols[idxName] || '').trim();
+        const kelas = idxClass !== -1 ? (cols[idxClass] || '').trim() : '10';
+        const wilayahRaw = idxWilayah !== -1 ? cols[idxWilayah] : 'putra';
+        const studentCodeRaw = idxStudentCode !== -1 ? (cols[idxStudentCode] || '').trim() : '';
+        const kodeLaptopRaw = idxLaptopCode !== -1 ? (cols[idxLaptopCode] || '').trim() : '';
+        const merkLaptopRaw = idxLaptopBrand !== -1 ? (cols[idxLaptopBrand] || '').trim() : '';
+        const fotoRaw = idxPhoto !== -1 ? (cols[idxPhoto] || '').trim() : '';
+
         return {
+          student_code: studentCodeRaw ? studentCodeRaw.toUpperCase() : undefined,
           name: nama,
-          class: kelas,
-          wilayah: parseWilayahCol(wilayah),
-          laptop_code: kodeLaptop ? kodeLaptop.toUpperCase() : undefined,
-          laptop_brand: merkLaptop || undefined,
-          photo_url: foto || null,
+          class: kelas || '10',
+          wilayah: parseWilayahCol(wilayahRaw),
+          laptop_code: kodeLaptopRaw ? kodeLaptopRaw.toUpperCase() : undefined,
+          laptop_brand: merkLaptopRaw || undefined,
+          photo_url: fotoRaw || null,
         };
       }
 
-      if (hasLaptop) {
-        const [nama, kelas, kodeLaptop, merkLaptop, foto] = cols;
+      // Positional fallback
+      const [c0, c1, c2, c3, c4, c5] = cols;
+      // Check if c0 looks like a student code (SIS-XXXX)
+      if (/^SIS[-_]?\d+/i.test(c0 || '') && c1) {
         return {
-          name: nama,
-          class: kelas,
-          wilayah: 'putra' as Wilayah,
-          laptop_code: kodeLaptop ? kodeLaptop.toUpperCase() : undefined,
-          laptop_brand: merkLaptop || undefined,
-          photo_url: foto || null,
+          student_code: c0.toUpperCase(),
+          name: c1,
+          class: c2 || '10',
+          wilayah: parseWilayahCol(c3),
+          laptop_code: c4 ? c4.toUpperCase() : undefined,
+          laptop_brand: c5 || undefined,
+          photo_url: null,
         };
       }
 
-      const [nama, kelas, wilayahOrFoto] = cols;
       return {
-        name: nama,
-        class: kelas,
-        wilayah: hasWilayah ? parseWilayahCol(wilayahOrFoto) : ('putra' as Wilayah),
-        photo_url: hasWilayah ? null : wilayahOrFoto || null,
+        name: c0 || '',
+        class: c1 || '10',
+        wilayah: parseWilayahCol(c2),
+        laptop_code: c3 ? c3.toUpperCase() : undefined,
+        laptop_brand: c4 || undefined,
+        photo_url: c5 || null,
       };
     })
-    .filter((row) => Boolean(row.name) && Boolean(row.class));
+    .filter((row) => Boolean(row.name));
 }
 
 /**
- * Parse Laptop-only CSV/Excel template:
+ * Header-aware & fallback parser for Laptop-only CSV/Excel template:
  * Kolom: kode_laptop | merk_laptop | kode_siswa
  */
 export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
   const lines = normalizeCsvLines(text);
-  if (lines.length <= 1) return [];
+  if (lines.length === 0) return [];
 
-  return lines
-    .slice(1)
+  const firstRowCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase().trim());
+  const isHeaderRow = firstRowCols.some(
+    (c) =>
+      c.includes('kode') ||
+      c.includes('laptop') ||
+      c.includes('merk') ||
+      c.includes('brand') ||
+      c.includes('siswa') ||
+      c.includes('nama')
+  );
+
+  const dataLines = isHeaderRow ? lines.slice(1) : lines;
+
+  const findColIdx = (patterns: RegExp[]): number => {
+    if (!isHeaderRow) return -1;
+    for (const pat of patterns) {
+      const idx = firstRowCols.findIndex((h) => pat.test(h.replace(/\s+/g, '_')));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  const idxLaptopCode = findColIdx([
+    /^(kode_laptop|asset_code|barcode_tas|kode_tas|kode_barcode|barcode)$/,
+    /kode.*laptop|barcode/,
+  ]);
+  const idxBrand = findColIdx([
+    /^(merk_laptop|merk|brand|brand_model|tipe_laptop|model)$/,
+    /merk|brand/,
+  ]);
+  const idxStudentRef = findColIdx([
+    /^(kode_siswa|student_code|nama_siswa|nama|pemilik|siswa)$/,
+    /siswa|nama|pemilik/,
+  ]);
+
+  return dataLines
     .map((line) => {
-      const [kodeLaptop, merkLaptop, kodeSiswa] = splitCsvLine(line);
+      let cols = splitCsvLine(line);
+      if (!isHeaderRow && cols.length >= 3 && /^\d{1,3}$/.test(cols[0]) && /^LAP/i.test(cols[1])) {
+        cols = cols.slice(1);
+      }
+
+      if (isHeaderRow && idxLaptopCode !== -1) {
+        const kodeLaptop = (cols[idxLaptopCode] || '').trim();
+        const merkLaptop = idxBrand !== -1 ? (cols[idxBrand] || '').trim() : 'Laptop Sekolah';
+        const kodeSiswa = idxStudentRef !== -1 ? (cols[idxStudentRef] || '').trim() : '';
+        return {
+          asset_code: kodeLaptop.toUpperCase(),
+          brand_model: merkLaptop || 'Laptop Sekolah',
+          student_code: kodeSiswa || undefined,
+        };
+      }
+
+      const [kodeLaptop, merkLaptop, kodeSiswa] = cols;
       return {
         asset_code: (kodeLaptop || '').toUpperCase(),
         brand_model: merkLaptop || 'Laptop Sekolah',
-        student_code: kodeSiswa ? kodeSiswa.toUpperCase() : undefined,
+        student_code: kodeSiswa ? kodeSiswa.trim() : undefined,
       };
     })
     .filter((row) => Boolean(row.asset_code));
 }
 
 /**
- * Parse Staff / Guru Piket CSV/Excel template:
+ * Header-aware & fallback parser for Staff / Guru Piket CSV/Excel template:
  * Kolom: nama | username | token_barcode | wilayah | role | password
  */
 export function parseStaffCsv(text: string): ParsedStaffRow[] {
   const lines = normalizeCsvLines(text);
-  if (lines.length <= 1) return [];
+  if (lines.length === 0) return [];
 
-  return lines
-    .slice(1)
+  const firstRowCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase().trim());
+  const isHeaderRow = firstRowCols.some(
+    (c) =>
+      c.includes('nama') ||
+      c.includes('username') ||
+      c.includes('token') ||
+      c.includes('barcode') ||
+      c.includes('wilayah') ||
+      c.includes('role')
+  );
+
+  const dataLines = isHeaderRow ? lines.slice(1) : lines;
+
+  const findColIdx = (patterns: RegExp[]): number => {
+    if (!isHeaderRow) return -1;
+    for (const pat of patterns) {
+      const idx = firstRowCols.findIndex((h) => pat.test(h.replace(/\s+/g, '_')));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  const idxName = findColIdx([/^(nama|nama_pegawai|nama_guru|name|guru|pegawai)$/, /nama/]);
+  const idxUsername = findColIdx([/^(username|user|akun|id_login)$/]);
+  const idxToken = findColIdx([
+    /^(token_barcode|piket_token|token|kode_barcode|barcode|kode_token)$/,
+    /token|barcode|kode/,
+  ]);
+  const idxWilayah = findColIdx([/^(wilayah|pos|asrama)$/]);
+  const idxRole = findColIdx([/^(role|jabatan|peran)$/]);
+  const idxPassword = findColIdx([/^(password|pass|sandi|kata_sandi)$/]);
+
+  return dataLines
     .map((line) => {
-      const [nama, username, tokenBarcode, wilayah, role, password] = splitCsvLine(line);
+      let cols = splitCsvLine(line);
+      if (!isHeaderRow && cols.length >= 3 && /^\d{1,3}$/.test(cols[0])) {
+        cols = cols.slice(1);
+      }
+
+      let nama = '';
+      let username = '';
+      let tokenBarcode = '';
+      let wilayah = '';
+      let role = '';
+      let password = '';
+
+      if (isHeaderRow && idxName !== -1) {
+        nama = (cols[idxName] || '').trim();
+        username = idxUsername !== -1 ? (cols[idxUsername] || '').trim() : '';
+        tokenBarcode = idxToken !== -1 ? (cols[idxToken] || '').trim() : '';
+        wilayah = idxWilayah !== -1 ? (cols[idxWilayah] || '').trim() : 'putra';
+        role = idxRole !== -1 ? (cols[idxRole] || '').trim() : 'piket';
+        password = idxPassword !== -1 ? (cols[idxPassword] || '').trim() : '';
+      } else {
+        [nama, username, tokenBarcode, wilayah, role, password] = cols;
+        // If only 2 columns were provided (nama, token_barcode)
+        if (cols.length === 2 && nama && username && !tokenBarcode) {
+          tokenBarcode = username;
+          username = '';
+        }
+      }
+
       const normRole: StaffRole =
         (role || '').trim().toLowerCase() === 'admin' ? 'admin' : 'piket';
       const cleanUser =
@@ -494,6 +655,200 @@ export function parseStaffCsv(text: string): ParsedStaffRow[] {
       };
     })
     .filter((row) => Boolean(row.name) && Boolean(row.username));
+}
+
+/**
+ * Normalizes a barcode/QR code string by stripping spaces, hyphens, underscores,
+ * and common prefixes so codes like "SIS-0007", "SIS0007", "SIS-7", "0007",
+ * "LAP-007", "LAP007", "PKT-205", "PKT205" can be matched reliably.
+ */
+export function normalizeCodeCompact(raw: string): string {
+  return (raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[\s\-_.:/\\]+/g, '');
+}
+
+export function extractPrefixAndNumber(raw: string): { prefix: string; num: number | null } {
+  const clean = (raw || '').trim().toUpperCase();
+  const m = clean.match(/^([A-Z]+)?[\s\-_.:]*0*(\d+)$/);
+  if (!m) return { prefix: clean, num: null };
+  return {
+    prefix: (m[1] || '').trim(),
+    num: Number.parseInt(m[2], 10),
+  };
+}
+
+/**
+ * Intelligently matches a scanned QR / 1D Barcode string to a Student.
+ * Supports:
+ * 1. Exact `student_code` (e.g. "SIS-0007")
+ * 2. Compact / unpadded `student_code` (e.g. "SIS0007", "SIS-7", "0007", "7")
+ * 3. The student's assigned `laptop.asset_code` from template (e.g. "LAP-007", "LAP007", "LAP-7")
+ * 4. Student name match (if barcode/QR was generated from student name)
+ * 5. Substring match inside multi-field QR codes
+ */
+export function findStudentByScannedCode(
+  rawCode: string,
+  students: Student[],
+  laptops: Laptop[]
+): Student | null {
+  const clean = (rawCode || '').trim();
+  if (!clean) return null;
+  const upper = clean.toUpperCase();
+  const compact = normalizeCodeCompact(upper);
+  const parsedScan = extractPrefixAndNumber(upper);
+
+  // 1. Exact student_code match
+  const exactStudent = students.find((s) => s.student_code.trim().toUpperCase() === upper);
+  if (exactStudent) return exactStudent;
+
+  // 2. Compact student_code match (e.g. "SIS0007" == "SIS-0007")
+  const compactStudent = students.find(
+    (s) => normalizeCodeCompact(s.student_code) === compact
+  );
+  if (compactStudent) return compactStudent;
+
+  // 3. Prefix + number match for SIS-XXXX (e.g. "SIS-7" or "0007" or "7" when scanning student card)
+  if (
+    parsedScan.num !== null &&
+    (parsedScan.prefix === 'SIS' || parsedScan.prefix === '' || parsedScan.prefix === 'SISWA')
+  ) {
+    const numMatched = students.find((s) => {
+      const sp = extractPrefixAndNumber(s.student_code);
+      return sp.num !== null && sp.num === parsedScan.num;
+    });
+    if (numMatched) return numMatched;
+  }
+
+  // 4. Match via assigned Laptop asset_code (if user scanned `kode_laptop` from template on Step 1!)
+  const matchedLaptop =
+    laptops.find((l) => l.asset_code.trim().toUpperCase() === upper) ||
+    laptops.find((l) => normalizeCodeCompact(l.asset_code) === compact) ||
+    (parsedScan.num !== null && (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS')
+      ? laptops.find((l) => {
+          const lp = extractPrefixAndNumber(l.asset_code);
+          return lp.num !== null && lp.num === parsedScan.num;
+        })
+      : undefined);
+
+  if (matchedLaptop?.assigned_student_id) {
+    const owner = students.find((s) => s.id === matchedLaptop.assigned_student_id);
+    if (owner) return owner;
+  }
+
+  // 5. Exact or compact student Name match (if user created barcode from student's name)
+  const nameMatched = students.find(
+    (s) =>
+      s.name.trim().toUpperCase() === upper ||
+      normalizeCodeCompact(s.name) === compact
+  );
+  if (nameMatched) return nameMatched;
+
+  // 6. Substring match inside multi-field QR text (e.g., "SIS-0007 | Rina Putri")
+  const substringStudent = students.find(
+    (s) =>
+      upper.includes(s.student_code.trim().toUpperCase()) ||
+      (s.name.trim().length >= 4 && upper.includes(s.name.trim().toUpperCase()))
+  );
+  if (substringStudent) return substringStudent;
+
+  // 7. Numeric match against assigned laptop if no prefix was typed/scanned
+  if (parsedScan.num !== null && parsedScan.prefix === '') {
+    const lapByNum = laptops.find((l) => {
+      const lp = extractPrefixAndNumber(l.asset_code);
+      return lp.num !== null && lp.num === parsedScan.num && Boolean(l.assigned_student_id);
+    });
+    if (lapByNum?.assigned_student_id) {
+      const owner = students.find((s) => s.id === lapByNum.assigned_student_id);
+      if (owner) return owner;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Intelligently matches a scanned QR / 1D Barcode string to a Laptop on Step 2 (Scan Gantungan Tas).
+ * Supports:
+ * 1. Exact `asset_code` (e.g. "LAP-007")
+ * 2. Compact / unpadded `asset_code` (e.g. "LAP007", "LAP-7", "007", "7")
+ * 3. Substring match inside multi-field QR text
+ * 4. If user scans the verified student's card/code again, resolves to their assigned laptop
+ */
+export function findLaptopByScannedCode(
+  rawCode: string,
+  laptops: Laptop[],
+  students: Student[],
+  currentScannedStudent?: Student | null
+): Laptop | null {
+  const clean = (rawCode || '').trim();
+  if (!clean) return null;
+  const upper = clean.toUpperCase();
+  const compact = normalizeCodeCompact(upper);
+  const parsedScan = extractPrefixAndNumber(upper);
+
+  // 1. Exact asset_code match
+  const exactLaptop = laptops.find((l) => l.asset_code.trim().toUpperCase() === upper);
+  if (exactLaptop) return exactLaptop;
+
+  // 2. Compact asset_code match (e.g. "LAP007" == "LAP-007")
+  const compactLaptop = laptops.find((l) => normalizeCodeCompact(l.asset_code) === compact);
+  if (compactLaptop) return compactLaptop;
+
+  // 3. Prefix + number match for LAP-XXX (e.g. "LAP-7" or "007" or "7")
+  if (
+    parsedScan.num !== null &&
+    (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS' || parsedScan.prefix === '')
+  ) {
+    // Prefer the laptop owned by currentScannedStudent if number matches
+    if (currentScannedStudent) {
+      const ownedMatch = laptops.find((l) => {
+        const lp = extractPrefixAndNumber(l.asset_code);
+        return (
+          l.assigned_student_id === currentScannedStudent.id &&
+          lp.num !== null &&
+          lp.num === parsedScan.num
+        );
+      });
+      if (ownedMatch) return ownedMatch;
+    }
+    const numMatched = laptops.find((l) => {
+      const lp = extractPrefixAndNumber(l.asset_code);
+      return lp.num !== null && lp.num === parsedScan.num;
+    });
+    if (numMatched) return numMatched;
+  }
+
+  // 4. Substring match inside multi-field QR text
+  const substringLaptop = laptops.find((l) =>
+    upper.includes(l.asset_code.trim().toUpperCase())
+  );
+  if (substringLaptop) return substringLaptop;
+
+  // 5. If user scanned the student card (`SIS-XXXX` or student name) on Scan 2, resolve to that student's assigned laptop
+  if (currentScannedStudent) {
+    const isSameStudentCode =
+      currentScannedStudent.student_code.trim().toUpperCase() === upper ||
+      normalizeCodeCompact(currentScannedStudent.student_code) === compact ||
+      currentScannedStudent.name.trim().toUpperCase() === upper;
+    if (isSameStudentCode) {
+      const assigned = laptops.find((l) => l.assigned_student_id === currentScannedStudent.id);
+      if (assigned) return assigned;
+    }
+  }
+
+  const matchedStudent = students.find(
+    (s) =>
+      s.student_code.trim().toUpperCase() === upper ||
+      normalizeCodeCompact(s.student_code) === compact
+  );
+  if (matchedStudent) {
+    const assigned = laptops.find((l) => l.assigned_student_id === matchedStudent.id);
+    if (assigned) return assigned;
+  }
+
+  return null;
 }
 
 export function formatDateTimeID(iso: string | null): string {

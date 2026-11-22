@@ -187,6 +187,7 @@ export function saveStateToLocalQuotaCache(state: AppStatePayload): void {
     const compact = JSON.stringify({
       students: state.students,
       laptops: state.laptops,
+      staff: state.staff,
       schedules: state.schedules,
       dailySessions: state.dailySessions,
       transactions: state.transactions,
@@ -320,6 +321,7 @@ export async function flushStateToFirestoreNow(
   const serializable = {
     students: targetState.students,
     laptops: targetState.laptops,
+    staff: targetState.staff,
     schedules: targetState.schedules,
     dailySessions: targetState.dailySessions,
     transactions: targetState.transactions,

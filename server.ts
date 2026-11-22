@@ -26,7 +26,12 @@ import {
   TransactionType,
   Wilayah,
 } from './src/types/models';
-import { validateDailySessionSelection } from './src/lib/store';
+import {
+  extractPrefixAndNumber,
+  findStudentByScannedCode,
+  normalizeCodeCompact,
+  validateDailySessionSelection,
+} from './src/lib/store';
 
 const PORT = Number(process.env.PORT || 3000);
 const SESSION_SECRET =
@@ -783,15 +788,78 @@ function getActivePiketOptions(): PiketOption[] {
     }));
 }
 
-function buildStateForRole(role: StaffRole | 'public') {
+function ensureServerStudentsHaveLaptopAllocation() {
+  const assignedStudentIds = new Set(
+    db.laptops.map((l) => l.assigned_student_id).filter(Boolean) as string[]
+  );
+  const nowIso = new Date().toISOString();
+
+  for (const st of db.students) {
+    if (assignedStudentIds.has(st.id)) continue;
+
+    const parsedStu = extractPrefixAndNumber(st.student_code);
+    const desiredLapCode =
+      parsedStu.num !== null
+        ? `LAP-${String(parsedStu.num).padStart(3, '0')}`
+        : `LAP-${st.student_code.replace(/^SIS[-_]?/i, '')}`;
+
+    const matchingUnassigned = db.laptops.find(
+      (l) =>
+        !l.assigned_student_id &&
+        (l.asset_code.toUpperCase() === desiredLapCode.toUpperCase() ||
+          (parsedStu.num !== null &&
+            extractPrefixAndNumber(l.asset_code).num === parsedStu.num))
+    );
+
+    if (matchingUnassigned) {
+      matchingUnassigned.assigned_student_id = st.id;
+      assignedStudentIds.add(st.id);
+      continue;
+    }
+
+    if (!db.laptops.some((l) => l.asset_code.toUpperCase() === desiredLapCode.toUpperCase())) {
+      db.laptops.push({
+        id: makeId('lap'),
+        asset_code: desiredLapCode.toUpperCase(),
+        brand_model: 'Laptop Sekolah',
+        status: 'available',
+        assigned_student_id: st.id,
+        created_at: nowIso,
+      });
+      assignedStudentIds.add(st.id);
+      continue;
+    }
+
+    let nextNum = Math.max(db.laptops.length + 1, parsedStu.num || 1);
+    while (
+      db.laptops.some(
+        (l) => l.asset_code.toUpperCase() === `LAP-${String(nextNum).padStart(3, '0')}`
+      )
+    ) {
+      nextNum++;
+    }
+    db.laptops.push({
+      id: makeId('lap'),
+      asset_code: `LAP-${String(nextNum).padStart(3, '0')}`,
+      brand_model: 'Laptop Sekolah',
+      status: 'available',
+      assigned_student_id: st.id,
+      created_at: nowIso,
+    });
+    assignedStudentIds.add(st.id);
+  }
+}
+
+function buildStateForRole(_role: StaffRole | 'public') {
   refreshExpiredSuspensions(db.students);
+  ensureServerStudentsHaveLaptopAllocation();
   return {
     students: db.students,
     laptops: db.laptops,
     schedules: db.schedules,
     dailySessions: db.dailySessions,
     transactions: db.transactions,
-    staff: role === 'admin' ? sanitizeStaffList() : [],
+    staff: sanitizeStaffList(),
     piketOptions: getActivePiketOptions(),
     printSettings: db.printSettings,
     kioskState: db.kioskState,
@@ -997,11 +1065,59 @@ async function startServer() {
     }
 
     if (Array.isArray(bundle.students) && bundle.students.length > 0) {
-      db.students = bundle.students.slice(0, 1000);
+      const mergedStudents = [...db.students];
+      for (const incoming of bundle.students.slice(0, 1000)) {
+        const idx = mergedStudents.findIndex(
+          (s) =>
+            s.id === incoming.id ||
+            s.student_code.toUpperCase() === incoming.student_code.toUpperCase()
+        );
+        if (idx !== -1) {
+          mergedStudents[idx] = { ...mergedStudents[idx], ...incoming };
+        } else {
+          mergedStudents.push(incoming);
+        }
+      }
+      db.students = mergedStudents;
       db.studentSeq = Math.max(db.studentSeq, db.students.length + 1);
     }
     if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
-      db.laptops = bundle.laptops.slice(0, 1000);
+      const mergedLaptops = [...db.laptops];
+      for (const incoming of bundle.laptops.slice(0, 1000)) {
+        const idx = mergedLaptops.findIndex(
+          (l) =>
+            l.id === incoming.id ||
+            l.asset_code.toUpperCase() === incoming.asset_code.toUpperCase()
+        );
+        if (idx !== -1) {
+          mergedLaptops[idx] = { ...mergedLaptops[idx], ...incoming };
+        } else {
+          mergedLaptops.push(incoming);
+        }
+      }
+      db.laptops = mergedLaptops;
+    }
+    if (Array.isArray(bundle.staff) && bundle.staff.length > 0) {
+      for (const incoming of bundle.staff.slice(0, 200)) {
+        const existing = db.staff.find(
+          (s) =>
+            s.id === incoming.id ||
+            s.username.toLowerCase() === incoming.username.toLowerCase() ||
+            s.piket_token.toUpperCase() === incoming.piket_token.toUpperCase()
+        );
+        if (existing) {
+          existing.name = incoming.name;
+          existing.piket_token = incoming.piket_token;
+          existing.wilayah = incoming.wilayah;
+          existing.role = incoming.role;
+          existing.is_active = incoming.is_active;
+        } else {
+          db.staff.push({
+            ...incoming,
+            passwordHash: hashPassword('121320'),
+          });
+        }
+      }
     }
     if (Array.isArray(bundle.schedules) && bundle.schedules.length > 0) {
       db.schedules = bundle.schedules.slice(0, 200);
@@ -1138,18 +1254,34 @@ async function startServer() {
       return;
     }
 
-    const cleaned = rawBarcode.replace(/^(GURU|PIKET|TOKEN|BARCODE)[:\-]/i, '').trim();
+    const cleaned = rawBarcode.replace(/^(GURU|PIKET|TOKEN|BARCODE)[:\-\s]*/i, '').trim();
+    const compactCleaned = normalizeCodeCompact(cleaned);
+    const parsedScan = extractPrefixAndNumber(cleaned);
 
     let matchedStaff: StoredStaff | undefined;
     for (const stf of db.staff) {
       if (!stf.is_active) continue;
+      const tokenUpper = stf.piket_token.trim().toUpperCase();
+      const userUpper = stf.username.trim().toUpperCase();
+      const nameUpper = stf.name.trim().toUpperCase();
       if (
         safeCompareStrings(cleaned, stf.piket_token) ||
         safeCompareStrings(rawBarcode, stf.piket_token) ||
-        safeCompareStrings(cleaned, stf.username)
+        safeCompareStrings(cleaned, stf.username) ||
+        normalizeCodeCompact(tokenUpper) === compactCleaned ||
+        normalizeCodeCompact(userUpper) === compactCleaned ||
+        nameUpper === cleaned ||
+        normalizeCodeCompact(nameUpper) === compactCleaned
       ) {
         matchedStaff = stf;
         break;
+      }
+      if (parsedScan.num !== null) {
+        const sp = extractPrefixAndNumber(tokenUpper);
+        if (sp.num !== null && sp.num === parsedScan.num) {
+          matchedStaff = stf;
+          break;
+        }
       }
     }
 
@@ -1533,35 +1665,71 @@ async function startServer() {
 
     for (const raw of rows) {
       const name = typeof raw?.name === 'string' ? raw.name.trim() : '';
-      const cls = typeof raw?.class === 'string' ? raw.class.trim() : '';
+      const cls = typeof raw?.class === 'string' && raw.class.trim() ? raw.class.trim() : '10';
       const wilayah = normalizeWilayah(raw?.wilayah, 'putra');
+      const customCode =
+        typeof raw?.student_code === 'string' ? raw.student_code.trim().toUpperCase() : '';
       const laptopCode =
         typeof raw?.laptop_code === 'string' ? raw.laptop_code.trim().toUpperCase() : '';
       const laptopBrand =
         typeof raw?.laptop_brand === 'string' ? raw.laptop_brand.trim() : '';
       const photoUrl = sanitizePhotoUrl(raw?.photo_url);
 
-      if (!name || !cls) continue;
+      if (!name) continue;
 
-      const student: Student = {
-        id: makeId('stu'),
-        student_code: formatStudentCode(db.studentSeq++),
-        name: name.slice(0, 120),
-        class: cls.slice(0, 40),
-        wilayah,
-        photo_url: photoUrl,
-        late_count: 0,
-        is_suspended: false,
-        suspended_until: null,
-        suspended_reason: null,
-        created_at: nowIso,
-      };
-      db.students.push(student);
-      createdStudents++;
+      let student = db.students.find(
+        (s) =>
+          (customCode && s.student_code.toUpperCase() === customCode) ||
+          (s.name.trim().toLowerCase() === name.toLowerCase() &&
+            s.class.trim().toLowerCase() === cls.toLowerCase())
+      );
+
+      if (student) {
+        student.name = name.slice(0, 120);
+        student.class = cls.slice(0, 40);
+        student.wilayah = wilayah;
+        if (customCode) student.student_code = customCode.slice(0, 40);
+        if (photoUrl) student.photo_url = photoUrl;
+        createdStudents++;
+      } else {
+        student = {
+          id: makeId('stu'),
+          student_code: (customCode || formatStudentCode(db.studentSeq++)).slice(0, 40),
+          name: name.slice(0, 120),
+          class: cls.slice(0, 40),
+          wilayah,
+          photo_url: photoUrl,
+          late_count: 0,
+          is_suspended: false,
+          suspended_until: null,
+          suspended_reason: null,
+          created_at: nowIso,
+        };
+        db.students.push(student);
+        createdStudents++;
+      }
 
       if (laptopCode) {
-        const exists = db.laptops.some((l) => l.asset_code.toUpperCase() === laptopCode);
-        if (!exists) {
+        for (const l of db.laptops) {
+          if (
+            l.assigned_student_id === student.id &&
+            normalizeCodeCompact(l.asset_code) !== normalizeCodeCompact(laptopCode)
+          ) {
+            l.assigned_student_id = null;
+          }
+        }
+
+        const existingLaptop = db.laptops.find(
+          (l) =>
+            l.asset_code.toUpperCase() === laptopCode ||
+            normalizeCodeCompact(l.asset_code) === normalizeCodeCompact(laptopCode)
+        );
+        if (existingLaptop) {
+          existingLaptop.asset_code = laptopCode.slice(0, 40);
+          if (laptopBrand) existingLaptop.brand_model = laptopBrand.slice(0, 100);
+          existingLaptop.assigned_student_id = student.id;
+          createdLaptops++;
+        } else {
           db.laptops.push({
             id: makeId('lap'),
             asset_code: laptopCode.slice(0, 40),
@@ -1759,25 +1927,42 @@ async function startServer() {
 
       if (!assetCode) continue;
 
-      let matchedStudent: Student | undefined;
+      let matchedStudent: Student | null = null;
       if (studentRef) {
-        matchedStudent = db.students.find(
-          (s) =>
-            s.student_code.toUpperCase() === studentRef.toUpperCase() ||
-            s.name.toLowerCase() === studentRef.toLowerCase()
-        );
+        matchedStudent = findStudentByScannedCode(studentRef, db.students, db.laptops);
+        if (!matchedStudent && !/^SIS[-_]?\d+$/i.test(studentRef) && studentRef.length >= 2) {
+          const newStu: Student = {
+            id: makeId('stu'),
+            student_code: formatStudentCode(db.studentSeq++),
+            name: studentRef.slice(0, 120),
+            class: '10',
+            wilayah: 'putra',
+            photo_url: null,
+            late_count: 0,
+            is_suspended: false,
+            suspended_until: null,
+            suspended_reason: null,
+            created_at: nowIso,
+          };
+          db.students.push(newStu);
+          matchedStudent = newStu;
+        }
       }
 
       if (matchedStudent) {
         db.laptops = db.laptops.map((l) =>
           l.assigned_student_id === matchedStudent!.id &&
-          l.asset_code.toUpperCase() !== assetCode
+          normalizeCodeCompact(l.asset_code) !== normalizeCodeCompact(assetCode)
             ? { ...l, assigned_student_id: null }
             : l
         );
       }
 
-      const existing = db.laptops.find((l) => l.asset_code.toUpperCase() === assetCode);
+      const existing = db.laptops.find(
+        (l) =>
+          l.asset_code.toUpperCase() === assetCode ||
+          normalizeCodeCompact(l.asset_code) === normalizeCodeCompact(assetCode)
+      );
       if (existing) {
         existing.brand_model = brandModel.slice(0, 100);
         if (matchedStudent) {

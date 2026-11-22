@@ -38,6 +38,8 @@ import {
 } from '../types/models';
 import { api, ApiError, BorrowPayload } from '../lib/api';
 import {
+  findLaptopByScannedCode,
+  findStudentByScannedCode,
   formatDateOnly,
   formatTimeOnly,
   getCurrentSuggestedSessionKey,
@@ -396,40 +398,22 @@ export function ScanView({
     const nowTimeStr = formatTimeOnly(new Date().toISOString());
 
     // -------------------------------------------------------------------------
-    // PHASE A: SCAN KARTU SISWA (SIS-XXXX)
+    // PHASE A: SCAN KARTU SISWA (SIS-XXXX ATAU KODE DARI TEMPLATE)
     // -------------------------------------------------------------------------
     if (scanPhase === 'scan_card') {
-      const student =
-        students.find((s) => s.student_code.toUpperCase() === cleanCode) || null;
+      const student = findStudentByScannedCode(cleanCode, students, laptops);
 
       if (!student) {
         playFeedback('error');
         setInlineScanError(
-          `Kode Kartu Siswa "${cleanCode}" tidak ditemukan. Pastikan men-scan Kartu Siswa (format SIS-XXXX) terlebih dahulu.`
+          `Kode Kartu Siswa "${cleanCode}" tidak ditemukan. Pastikan data siswa sudah masuk atau men-scan Kartu Siswa (format SIS-XXXX / kode dari template).`
         );
         return;
       }
 
       if (student.wilayah !== selectedWilayah) {
-        playFeedback('error');
-        setValidationResult({
-          status: 'error',
-          headline: 'SALAH WILAYAH POS SCAN',
-          subheadline: `${student.name} terdaftar di ${WILAYAH_LABELS[student.wilayah]}, tidak sesuai dengan pos aktif ${WILAYAH_LABELS[selectedWilayah]}.`,
-          student,
-          laptop: laptopByStudentMap.get(student.id) || null,
-          sessionLabel: currentSessionTitle,
-          customActivityText: customActivityInput.trim() || null,
-          deadlineLabel:
-            scanMode === 'pulang'
-              ? formatDateOnly(`${plannedReturnDate}T17:00:00`)
-              : activeDailySession.deadline_time,
-          piketName: piketTicket.name,
-          ticketNumber: piketTicket.ticket_number,
-          timestamp: nowTimeStr,
-        });
-        setWizardStep('validation_panel');
-        return;
+        setSelectedWilayah(student.wilayah);
+        onUpdateKioskState({ selectedWilayah: student.wilayah });
       }
 
       const laptopJatah = laptopByStudentMap.get(student.id) || null;
@@ -502,8 +486,12 @@ export function ScanView({
         return;
       }
 
-      const scannedLaptop =
-        laptops.find((l) => l.asset_code.toUpperCase() === cleanCode) || null;
+      const scannedLaptop = findLaptopByScannedCode(
+        cleanCode,
+        laptops,
+        students,
+        scannedStudent
+      );
 
       if (!scannedLaptop) {
         playFeedback('error');
@@ -556,7 +544,7 @@ export function ScanView({
             customActivity: customActivityInput.trim() || undefined,
             customDeadlineTime:
               selectedSessionKey === 'kegiatan_lainnya' ? customDeadlineTime : undefined,
-            wilayah: selectedWilayah,
+            wilayah: scannedStudent.wilayah || selectedWilayah,
             piketId: piketTicket.id,
             piketToken: piketTicket.piket_token,
             plannedReturnDate: scanMode === 'pulang' ? plannedReturnDate : undefined,
@@ -732,6 +720,52 @@ export function ScanView({
     setManualInputCode('');
     handleCameraOrManualScan(code);
   };
+
+  // Support USB / Wireless Hardware Barcode Scanners even when manual input is not focused
+  useEffect(() => {
+    let buffer = '';
+    let lastKeyTime = 0;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - lastKeyTime > 250) {
+        buffer = '';
+      }
+      lastKeyTime = now;
+
+      if (e.key === 'Enter') {
+        const scanned = buffer.trim();
+        buffer = '';
+        if (scanned.length >= 2) {
+          e.preventDefault();
+          if (wizardStep === 'piket_login') {
+            handlePiketBarcodeLogin(scanned);
+          } else if (wizardStep === 'scan_student') {
+            handleCameraOrManualScan(scanned);
+          }
+        }
+        return;
+      }
+
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        buffer += e.key;
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
 
   // Klik tombol OKE pada Panel Validasi Besar -> langsung kembali ke kamera awal Scan Kartu Siswa
   const handleValidationOkNextStudent = () => {
