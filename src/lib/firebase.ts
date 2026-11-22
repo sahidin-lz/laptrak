@@ -13,6 +13,7 @@ import {
   getDoc,
   getDocFromServer,
   getFirestore,
+  onSnapshot,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -121,6 +122,7 @@ const BUNDLE_COLLECTION = 'kiosk_bundles';
 const MAIN_BUNDLE_ID = 'main';
 const AUDIT_COLLECTION = 'transaction_audits';
 const LOCAL_CACHE_KEY = 'laptrack_firebase_quota_cache_v1';
+const KIOSK_SYNC_OWNER_ID = 'laptrack-kiosk-sync-v1';
 
 export interface FirebaseQuotaTelemetry {
   projectId: string;
@@ -193,6 +195,7 @@ export function saveStateToLocalQuotaCache(state: AppStatePayload): void {
       transactions: state.transactions,
       printSettings: state.printSettings,
       kioskState: state.kioskState,
+      updatedAtMs: state.updatedAtMs || Date.now(),
       cachedAt: new Date().toISOString(),
     });
     localStorage.setItem(LOCAL_CACHE_KEY, compact);
@@ -216,33 +219,19 @@ export function loadStateFromLocalQuotaCache(): Partial<AppStatePayload> | null 
 }
 
 /**
- * Loads the consolidated school dataset from `/kiosk_bundles/main` using at most 1 Firestore Read.
- * If the user is not yet signed into Firebase Auth, falls back to local quota cache (0 Reads).
+ * Loads the consolidated school dataset from `/kiosk_bundles/main` using 1 Firestore Read.
+ * Always queries Firestore directly so Laptop & HP stay synchronized on Vercel even without Google OAuth popup.
  */
 export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePayload> | null> {
   const localCached = loadStateFromLocalQuotaCache();
-
-  if (!auth.currentUser) {
-    if (localCached) {
-      const estimatedDocs =
-        (localCached.students?.length || 0) +
-        (localCached.laptops?.length || 0) +
-        (localCached.transactions?.length || 0);
-      telemetry = {
-        ...telemetry,
-        savedOperations: telemetry.savedOperations + Math.max(estimatedDocs, 15),
-      };
-      notifyListeners();
-    }
-    return localCached;
-  }
-
+  const bundleRef = doc(db, BUNDLE_COLLECTION, MAIN_BUNDLE_ID);
   const bundlePath = `${BUNDLE_COLLECTION}/${MAIN_BUNDLE_ID}`;
+
   try {
     telemetry = { ...telemetry, syncStatus: 'syncing', lastError: null };
     notifyListeners();
 
-    const snap = await getDoc(doc(db, BUNDLE_COLLECTION, MAIN_BUNDLE_ID));
+    const snap = await getDocFromServer(bundleRef).catch(() => getDoc(bundleRef));
     telemetry.readsUsed += 1;
 
     if (snap.exists()) {
@@ -295,6 +284,52 @@ export async function loadBundleFromFirestoreOnce(): Promise<Partial<AppStatePay
 }
 
 /**
+ * Subscribes to real-time changes on the single consolidated document `/kiosk_bundles/main`
+ * so when the Admin uploads 106 laptops on the Laptop, the HP receives them live (and vice-versa).
+ */
+export function subscribeToCloudKioskBundle(
+  onRemoteBundle: (bundle: Partial<AppStatePayload>) => void
+): () => void {
+  const bundleRef = doc(db, BUNDLE_COLLECTION, MAIN_BUNDLE_ID);
+  const bundlePath = `${BUNDLE_COLLECTION}/${MAIN_BUNDLE_ID}`;
+
+  return onSnapshot(
+    bundleRef,
+    (snap) => {
+      if (!snap.exists()) return;
+      bundleExistsOnServer = true;
+      const data = snap.data();
+      const rawJson = typeof data.payloadJson === 'string' ? data.payloadJson : '';
+      const version = typeof data.version === 'number' ? data.version : 1;
+      if (!rawJson || rawJson === lastWrittenHash) return;
+
+      try {
+        lastWrittenHash = rawJson;
+        const parsed = JSON.parse(rawJson) as Partial<AppStatePayload>;
+        telemetry = {
+          ...telemetry,
+          bundleVersion: version,
+          lastSyncedAt: new Date().toLocaleTimeString('id-ID', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          }),
+          syncStatus: 'synced',
+          lastError: null,
+        };
+        notifyListeners();
+        onRemoteBundle(parsed);
+      } catch {
+        // Ignore malformed JSON
+      }
+    },
+    (err) => {
+      handleFirestoreError(err, OperationType.GET, bundlePath);
+    }
+  );
+}
+
+/**
  * Flushes the pending state bundle to `/kiosk_bundles/main` in a single Firestore write.
  * Enforces all schema and security rule invariants defined in `firestore.rules`.
  */
@@ -327,6 +362,7 @@ export async function flushStateToFirestoreNow(
     transactions: targetState.transactions,
     printSettings: targetState.printSettings,
     kioskState: targetState.kioskState,
+    updatedAtMs: targetState.updatedAtMs || Date.now(),
   };
 
   const payloadJson = JSON.stringify(serializable);
@@ -336,22 +372,6 @@ export async function flushStateToFirestoreNow(
     telemetry = {
       ...telemetry,
       savedOperations: telemetry.savedOperations + 1,
-    };
-    notifyListeners();
-    return true;
-  }
-
-  // If not signed in with Firebase Auth yet, keep in local quota cache (0 cloud writes)
-  if (!auth.currentUser) {
-    telemetry = {
-      ...telemetry,
-      savedOperations: telemetry.savedOperations + Math.max(estimatedDocsInBundle, 5),
-      lastSyncedAt: new Date().toLocaleTimeString('id-ID', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      }),
-      syncStatus: 'local_cache',
     };
     notifyListeners();
     return true;
@@ -373,6 +393,7 @@ export async function flushStateToFirestoreNow(
     targetState.printSettings?.schoolName || 'SMA NEGERI 1 NUSANTARA'
   ).slice(0, 120);
   const nextVersion = telemetry.bundleVersion + 1;
+  const effectiveOwnerId = auth.currentUser?.uid || KIOSK_SYNC_OWNER_ID;
 
   try {
     telemetry = { ...telemetry, syncStatus: 'syncing', lastError: null };
@@ -393,7 +414,7 @@ export async function flushStateToFirestoreNow(
     if (!bundleExistsOnServer) {
       await setDoc(bundleRef, {
         bundleId: MAIN_BUNDLE_ID,
-        ownerId: auth.currentUser.uid,
+        ownerId: effectiveOwnerId,
         schoolName,
         payloadJson: boundedPayloadJson,
         version: 1,
@@ -404,6 +425,7 @@ export async function flushStateToFirestoreNow(
       telemetry.bundleVersion = 1;
     } else {
       await updateDoc(bundleRef, {
+        ownerId: effectiveOwnerId,
         schoolName,
         payloadJson: boundedPayloadJson,
         version: nextVersion,
@@ -451,7 +473,7 @@ export async function flushStateToFirestoreNow(
  */
 export function scheduleQuotaSavingFirestoreSync(
   state: AppStatePayload,
-  delayMs = 2200
+  delayMs = 1200
 ): void {
   pendingStateForSync = state;
   saveStateToLocalQuotaCache(state);
@@ -472,7 +494,7 @@ export function scheduleQuotaSavingFirestoreSync(
 
 /**
  * Writes or updates a compact transaction audit record in `/transaction_audits/{txId}`
- * when authenticated with Firebase Auth, strictly adhering to `isValidTransactionAudit` rules.
+ * strictly adhering to `isValidTransactionAudit` rules.
  */
 export async function syncTransactionAuditToFirestore(
   tx: Transaction,
@@ -480,9 +502,7 @@ export async function syncTransactionAuditToFirestore(
   isNewBorrow: boolean
 ): Promise<void> {
   // Always coalesce state bundle
-  scheduleQuotaSavingFirestoreSync(state, 1200);
-
-  if (!auth.currentUser) return;
+  scheduleQuotaSavingFirestoreSync(state, 800);
 
   const cleanTxId = tx.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
   if (!cleanTxId) return;
@@ -493,12 +513,13 @@ export async function syncTransactionAuditToFirestore(
 
   const auditRef = doc(db, AUDIT_COLLECTION, cleanTxId);
   const auditPath = `${AUDIT_COLLECTION}/${cleanTxId}`;
+  const effectiveOwnerId = auth.currentUser?.uid || KIOSK_SYNC_OWNER_ID;
 
   try {
     if (isNewBorrow) {
       await setDoc(auditRef, {
         txId: cleanTxId,
-        ownerId: auth.currentUser.uid,
+        ownerId: effectiveOwnerId,
         studentCode: student.student_code.slice(0, 40),
         studentName: student.name.slice(0, 120),
         assetCode: laptop.asset_code.slice(0, 40),
@@ -513,6 +534,7 @@ export async function syncTransactionAuditToFirestore(
       notifyListeners();
     } else {
       await updateDoc(auditRef, {
+        ownerId: effectiveOwnerId,
         status: 'returned',
         purpose: (tx.purpose || 'Sudah Dikembalikan').slice(0, 160),
         piketName: (tx.return_piket_name || tx.piket_name || 'Guru Piket').slice(0, 100),

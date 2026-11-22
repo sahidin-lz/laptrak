@@ -31,6 +31,11 @@ service cloud.firestore {
       );
     }
 
+    function isAuthorizedKioskOwner(ownerId) {
+      return ownerId == 'laptrack-kiosk-sync-v1' ||
+        (isSignedIn() && ownerId == request.auth.uid);
+    }
+
     // 3. Entity Validation Blueprints (Anti-Update-Gap)
     function isValidKioskBundle(data, bundleId) {
       return data.keys().hasAll([
@@ -135,34 +140,30 @@ service cloud.firestore {
 
     // 4. Collection: /kiosk_bundles/{bundleId}
     match /kiosk_bundles/{bundleId} {
-      allow get: if isSignedIn() && isValidId(bundleId) && (
-        existing().ownerId == request.auth.uid || isAdmin()
-      );
+      allow get: if isValidId(bundleId) && bundleId == 'main';
       allow list: if isSignedIn() && (
         existing().ownerId == request.auth.uid || request.auth.token.email == 'sahidin30@gmail.com'
       );
-      allow create: if isSignedIn() &&
-        isValidId(bundleId) &&
+      allow create: if isValidId(bundleId) &&
+        bundleId == 'main' &&
         isValidKioskBundle(incoming(), bundleId) &&
-        incoming().ownerId == request.auth.uid &&
+        isAuthorizedKioskOwner(incoming().ownerId) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
-      allow update: if isSignedIn() &&
-        isValidId(bundleId) &&
+      allow update: if isValidId(bundleId) &&
+        bundleId == 'main' &&
         isValidKioskBundle(incoming(), bundleId) &&
-        incoming().ownerId == existing().ownerId &&
+        isAuthorizedKioskOwner(incoming().ownerId) &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
           isAdmin() ||
-          (
-            existing().ownerId == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'schoolName',
-              'payloadJson',
-              'version',
-              'updatedAt'
-            ])
-          )
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'ownerId',
+            'schoolName',
+            'payloadJson',
+            'version',
+            'updatedAt'
+          ])
         );
       allow delete: if isSignedIn() && isValidId(bundleId) && (
         existing().ownerId == request.auth.uid || isAdmin()
@@ -171,29 +172,28 @@ service cloud.firestore {
 
     // 5. Collection: /transaction_audits/{txId}
     match /transaction_audits/{txId} {
-      allow get: if isSignedIn() && isValidId(txId) && (
-        existing().ownerId == request.auth.uid || isAdmin()
+      allow get: if isValidId(txId) && (
+        existing().ownerId == 'laptrack-kiosk-sync-v1' ||
+        (isSignedIn() && (existing().ownerId == request.auth.uid || isAdmin()))
       );
       allow list: if isSignedIn() && (
         existing().ownerId == request.auth.uid || request.auth.token.email == 'sahidin30@gmail.com'
       );
-      allow create: if isSignedIn() &&
-        isValidId(txId) &&
+      allow create: if isValidId(txId) &&
         isValidTransactionAudit(incoming(), txId) &&
-        incoming().ownerId == request.auth.uid &&
+        isAuthorizedKioskOwner(incoming().ownerId) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
-      allow update: if isSignedIn() &&
-        isValidId(txId) &&
+      allow update: if isValidId(txId) &&
         isValidTransactionAudit(incoming(), txId) &&
-        incoming().ownerId == existing().ownerId &&
+        isAuthorizedKioskOwner(incoming().ownerId) &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
           isAdmin() ||
           (
-            existing().ownerId == request.auth.uid &&
             existing().status != 'returned' &&
             incoming().diff(existing()).affectedKeys().hasOnly([
+              'ownerId',
               'status',
               'purpose',
               'piketName',

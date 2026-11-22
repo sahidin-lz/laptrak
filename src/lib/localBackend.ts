@@ -40,6 +40,7 @@ interface LocalStaffRecord extends StaffMember {
 interface LocalDatabase {
   adminClaimed: boolean;
   studentSeq: number;
+  updatedAtMs?: number;
   staff: LocalStaffRecord[];
   students: Student[];
   laptops: Laptop[];
@@ -475,6 +476,7 @@ function createInitialLocalDb(): LocalDatabase {
     transactions,
     printSettings: { ...DEFAULT_PRINT_SETTINGS },
     kioskState: createInitialKioskState(),
+    updatedAtMs: 0,
   };
 }
 
@@ -484,6 +486,14 @@ function loadLocalDb(): LocalDatabase {
     if (raw) {
       const parsed = JSON.parse(raw) as LocalDatabase;
       if (parsed && Array.isArray(parsed.students) && Array.isArray(parsed.laptops)) {
+        // If this device already has uploaded data (> 6 default items) from before updatedAtMs was added,
+        // stamp it with a non-zero timestamp so it is automatically pushed to Firebase Firestore!
+        if (!parsed.updatedAtMs && (parsed.laptops.length > 6 || parsed.students.length > 6)) {
+          parsed.updatedAtMs = Date.now();
+          saveLocalDb(parsed);
+        } else if (typeof parsed.updatedAtMs !== 'number') {
+          parsed.updatedAtMs = 0;
+        }
         return parsed;
       }
     }
@@ -609,9 +619,16 @@ function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
   }
 }
 
-function buildAppState(): AppStatePayload {
+function buildAppState(touchModified = true): AppStatePayload {
   refreshExpiredSuspensions(localDb.students);
   ensureStudentsHaveLaptopAllocation(localDb);
+
+  if (touchModified) {
+    localDb.updatedAtMs = Date.now();
+  } else if (typeof localDb.updatedAtMs !== 'number') {
+    localDb.updatedAtMs =
+      localDb.laptops.length > 6 || localDb.students.length > 6 ? Date.now() : 0;
+  }
 
   const safeStaff: StaffMember[] = localDb.staff.map(
     ({ passwordPlain: _ignored, ...rest }) => rest
@@ -639,6 +656,7 @@ function buildAppState(): AppStatePayload {
     piketOptions,
     printSettings: { ...localDb.printSettings },
     kioskState: { ...localDb.kioskState },
+    updatedAtMs: localDb.updatedAtMs,
   };
 }
 
@@ -765,47 +783,49 @@ export const localBackend = {
     return { ok: true };
   },
 
-  getState: async (): Promise<AppStatePayload> => buildAppState(),
+  getState: async (): Promise<AppStatePayload> => buildAppState(false),
 
   hydrateState: async (bundle: Partial<AppStatePayload>): Promise<AppStatePayload> => {
-    // Non-destructively merge students so locally uploaded template rows are never lost
-    if (Array.isArray(bundle.students) && bundle.students.length > 0) {
-      const mergedStudents = [...localDb.students];
-      for (const incoming of bundle.students) {
-        const idx = mergedStudents.findIndex(
-          (s) =>
-            s.id === incoming.id ||
-            s.student_code.toUpperCase() === incoming.student_code.toUpperCase()
-        );
-        if (idx !== -1) {
-          mergedStudents[idx] = { ...mergedStudents[idx], ...incoming };
-        } else {
-          mergedStudents.push(incoming);
-        }
+    const incomingTime = typeof bundle.updatedAtMs === 'number' ? bundle.updatedAtMs : 0;
+    const localTime = typeof localDb.updatedAtMs === 'number' ? localDb.updatedAtMs : 0;
+    const incomingLaptopCount = Array.isArray(bundle.laptops) ? bundle.laptops.length : 0;
+    const localLaptopCount = localDb.laptops.length;
+
+    // Determine whether the incoming Firestore bundle is the newer/authoritative dataset
+    // (e.g., HP receiving 106 laptops from Firestore) OR whether this device (e.g., Laptop
+    // that already had 106 laptops in localStorage before cloud sync) has more/newer data.
+    const localHasMoreUnsyncedData =
+      localLaptopCount > incomingLaptopCount && localTime >= incomingTime;
+
+    if (!localHasMoreUnsyncedData) {
+      // Adopt exact dataset from Firestore bundle so HP matches Laptop 100% (e.g. exact 106 laptops)
+      if (Array.isArray(bundle.students) && bundle.students.length > 0) {
+        localDb.students = [...bundle.students];
+        localDb.studentSeq = Math.max(localDb.studentSeq, localDb.students.length + 1);
       }
-      localDb.students = mergedStudents;
-      localDb.studentSeq = Math.max(localDb.studentSeq, localDb.students.length + 1);
+      if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
+        localDb.laptops = [...bundle.laptops];
+      }
+      if (Array.isArray(bundle.transactions)) {
+        localDb.transactions = [...bundle.transactions];
+      }
+      if (Array.isArray(bundle.schedules) && bundle.schedules.length > 0) {
+        localDb.schedules = [...bundle.schedules];
+      }
+      if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
+        localDb.dailySessions = [...bundle.dailySessions];
+      }
+      if (bundle.printSettings) {
+        localDb.printSettings = { ...localDb.printSettings, ...bundle.printSettings };
+      }
+      localDb.updatedAtMs = Math.max(incomingTime, localTime);
+    } else {
+      // This device (e.g. Laptop with 106 uploaded laptops) has more local data than Firestore:
+      // keep local students & laptops intact and stamp updatedAtMs so it immediately pushes to Firestore
+      localDb.updatedAtMs = Math.max(localTime, Date.now());
     }
 
-    // Non-destructively merge laptops
-    if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
-      const mergedLaptops = [...localDb.laptops];
-      for (const incoming of bundle.laptops) {
-        const idx = mergedLaptops.findIndex(
-          (l) =>
-            l.id === incoming.id ||
-            l.asset_code.toUpperCase() === incoming.asset_code.toUpperCase()
-        );
-        if (idx !== -1) {
-          mergedLaptops[idx] = { ...mergedLaptops[idx], ...incoming };
-        } else {
-          mergedLaptops.push(incoming);
-        }
-      }
-      localDb.laptops = mergedLaptops;
-    }
-
-    // Non-destructively merge staff / Guru Piket tokens
+    // Always merge staff / Guru Piket accounts so custom tokens and built-in admins both remain active
     if (Array.isArray(bundle.staff) && bundle.staff.length > 0) {
       for (const incoming of bundle.staff) {
         const existing = localDb.staff.find(
@@ -829,31 +849,7 @@ export const localBackend = {
       }
     }
 
-    if (Array.isArray(bundle.schedules) && bundle.schedules.length > 0) {
-      localDb.schedules = bundle.schedules;
-    }
-    if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
-      localDb.dailySessions = bundle.dailySessions;
-    }
-    if (Array.isArray(bundle.transactions) && bundle.transactions.length > 0) {
-      const mergedTx = [...localDb.transactions];
-      for (const incoming of bundle.transactions) {
-        const idx = mergedTx.findIndex((t) => t.id === incoming.id);
-        if (idx !== -1) {
-          mergedTx[idx] = incoming;
-        } else {
-          mergedTx.push(incoming);
-        }
-      }
-      localDb.transactions = mergedTx;
-    }
-    if (bundle.printSettings) {
-      localDb.printSettings = { ...localDb.printSettings, ...bundle.printSettings };
-    }
-    if (bundle.kioskState) {
-      localDb.kioskState = { ...localDb.kioskState, ...bundle.kioskState };
-    }
-    return buildAppState();
+    return buildAppState(false);
   },
 
   updateKioskState: async (

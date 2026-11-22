@@ -14,7 +14,7 @@
         },
         "ownerId": {
           "type": "string",
-          "description": "UID of the authenticated administrator or school operator who owns this bundle.",
+          "description": "UID of the authenticated administrator or authorized school kiosk sync identifier ('laptrack-kiosk-sync-v1').",
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"

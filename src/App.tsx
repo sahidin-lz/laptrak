@@ -37,6 +37,7 @@ import {
   loadBundleFromFirestoreOnce,
   scheduleQuotaSavingFirestoreSync,
   subscribeFirebaseTelemetry,
+  subscribeToCloudKioskBundle,
   syncTransactionAuditToFirestore,
 } from './lib/firebase';
 import {
@@ -110,7 +111,7 @@ export default function App() {
   }, []);
 
   // Helper to update local React state AND schedule a debounced, quota-saving Firebase sync
-  const applyAndSyncState = useCallback((nextState: AppStatePayload, debounceMs = 2200) => {
+  const applyAndSyncState = useCallback((nextState: AppStatePayload, debounceMs = 800) => {
     setState(nextState);
     scheduleQuotaSavingFirestoreSync(nextState, debounceMs);
   }, []);
@@ -126,9 +127,15 @@ export default function App() {
       ]);
 
       let effectiveState = serverStateRes;
+      const cloudLaptopCount = Array.isArray(cachedOrFirestoreBundle?.laptops)
+        ? cachedOrFirestoreBundle.laptops.length
+        : 0;
+      const cloudStudentCount = Array.isArray(cachedOrFirestoreBundle?.students)
+        ? cachedOrFirestoreBundle.students.length
+        : 0;
 
       // If we have a persisted bundle from Firebase Firestore or local quota cache,
-      // hydrate the Express backend in 1 call so both server & Firebase match.
+      // hydrate the backend in 1 call so both device & Firebase match.
       if (
         cachedOrFirestoreBundle &&
         Array.isArray(cachedOrFirestoreBundle.students) &&
@@ -139,8 +146,16 @@ export default function App() {
         } catch {
           effectiveState = serverStateRes;
         }
-      } else {
-        scheduleQuotaSavingFirestoreSync(serverStateRes, 2500);
+      }
+
+      // If this device (e.g. Laptop where 106 laptops were uploaded) has MORE data than Firestore,
+      // flush it immediately to Firebase Firestore so the HP receives all 106 laptops right away!
+      if (
+        !cachedOrFirestoreBundle ||
+        effectiveState.laptops.length > cloudLaptopCount ||
+        effectiveState.students.length > cloudStudentCount
+      ) {
+        flushStateToFirestoreNow(effectiveState);
       }
 
       setUser(meRes.user);
@@ -169,6 +184,25 @@ export default function App() {
   useEffect(() => {
     initializeApp();
   }, [initializeApp]);
+
+  // Real-time cross-device cloud sync listener (Laptop <-> HP on Vercel)
+  useEffect(() => {
+    const unsub = subscribeToCloudKioskBundle(async (remoteBundle) => {
+      if (
+        remoteBundle &&
+        Array.isArray(remoteBundle.laptops) &&
+        remoteBundle.laptops.length > 0
+      ) {
+        try {
+          const hydrated = await api.hydrateState(remoteBundle);
+          setState(hydrated);
+        } catch {
+          // Ignore transient hydration error
+        }
+      }
+    });
+    return unsub;
+  }, []);
 
   const handleUpdateKioskState = useCallback(
     (patch: Partial<KioskPersistedState>) => {
@@ -409,8 +443,9 @@ export default function App() {
   const handleBulkAddStudents = async (rows: ParsedStudentLaptopRow[]) => {
     try {
       const res = await api.bulkAddStudents(rows);
-      // Coalesce entire CSV bulk import into 1 single Firestore write
-      applyAndSyncState(res.state, 1500);
+      setState(res.state);
+      // Immediately flush bulk import to Firebase Firestore in 1 write so HP & other devices get it right away
+      await flushStateToFirestoreNow(res.state);
       return {
         ok: true,
         createdStudents: res.createdStudents,
@@ -463,7 +498,8 @@ export default function App() {
   const handleBulkAddLaptops = async (rows: ParsedLaptopCsvRow[]) => {
     try {
       const res = await api.bulkAddLaptops(rows);
-      applyAndSyncState(res.state, 1500);
+      setState(res.state);
+      await flushStateToFirestoreNow(res.state);
       return {
         ok: true,
         createdLaptops: res.createdLaptops,
@@ -573,7 +609,8 @@ export default function App() {
   const handleBulkAddStaff = async (rows: ParsedStaffCsvRow[]) => {
     try {
       const res = await api.bulkAddStaff(rows);
-      applyAndSyncState(res.state, 1500);
+      setState(res.state);
+      await flushStateToFirestoreNow(res.state);
       return {
         ok: true,
         createdStaff: res.createdStaff,

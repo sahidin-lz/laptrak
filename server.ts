@@ -1064,38 +1064,17 @@ async function startServer() {
       return;
     }
 
-    if (Array.isArray(bundle.students) && bundle.students.length > 0) {
-      const mergedStudents = [...db.students];
-      for (const incoming of bundle.students.slice(0, 1000)) {
-        const idx = mergedStudents.findIndex(
-          (s) =>
-            s.id === incoming.id ||
-            s.student_code.toUpperCase() === incoming.student_code.toUpperCase()
-        );
-        if (idx !== -1) {
-          mergedStudents[idx] = { ...mergedStudents[idx], ...incoming };
-        } else {
-          mergedStudents.push(incoming);
-        }
+    const incomingLaptopCount = Array.isArray(bundle.laptops) ? bundle.laptops.length : 0;
+    const serverHasMoreUnsyncedData = db.laptops.length > incomingLaptopCount && db.laptops.length > 6;
+
+    if (!serverHasMoreUnsyncedData) {
+      if (Array.isArray(bundle.students) && bundle.students.length > 0) {
+        db.students = bundle.students.slice(0, 1000);
+        db.studentSeq = Math.max(db.studentSeq, db.students.length + 1);
       }
-      db.students = mergedStudents;
-      db.studentSeq = Math.max(db.studentSeq, db.students.length + 1);
-    }
-    if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
-      const mergedLaptops = [...db.laptops];
-      for (const incoming of bundle.laptops.slice(0, 1000)) {
-        const idx = mergedLaptops.findIndex(
-          (l) =>
-            l.id === incoming.id ||
-            l.asset_code.toUpperCase() === incoming.asset_code.toUpperCase()
-        );
-        if (idx !== -1) {
-          mergedLaptops[idx] = { ...mergedLaptops[idx], ...incoming };
-        } else {
-          mergedLaptops.push(incoming);
-        }
+      if (Array.isArray(bundle.laptops) && bundle.laptops.length > 0) {
+        db.laptops = bundle.laptops.slice(0, 1000);
       }
-      db.laptops = mergedLaptops;
     }
     if (Array.isArray(bundle.staff) && bundle.staff.length > 0) {
       for (const incoming of bundle.staff.slice(0, 200)) {

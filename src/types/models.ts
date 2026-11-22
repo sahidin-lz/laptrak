@@ -233,6 +233,7 @@ export interface AppStatePayload {
   piketOptions: PiketOption[];
   printSettings: PrintSettings;
   kioskState: KioskPersistedState;
+  updatedAtMs?: number;
 }
 
 export const MAX_LATE_STRIKES = 3;
