@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { Download, Loader2, X } from 'lucide-react';
+import { Download, FileImage, Loader2, X } from 'lucide-react';
 import { Laptop, PrintSettings, Student } from '../types/models';
 import { BagHangTagPreview, StudentCardPreview } from './CardPreview';
 import { exportBagTagsPdf, exportStudentCardsPdf } from '../lib/pdfGenerator';
+import { generateStudentOrLaptopCardPngDataUrl } from '../lib/barcode';
 
 interface CodePreviewModalProps {
   mode: 'student' | 'laptop';
@@ -24,6 +25,17 @@ export function CodePreviewModal({
   onClose,
 }: CodePreviewModalProps) {
   const [exporting, setExporting] = useState(false);
+  const [exportingPng, setExportingPng] = useState(false);
+
+  const assignedLaptop =
+    mode === 'student' && student
+      ? allLaptops.find((l) => l.assigned_student_id === student.id)
+      : laptop;
+
+  const ownerStudent =
+    mode === 'laptop' && laptop
+      ? allStudents.find((s) => s.id === laptop.assigned_student_id)
+      : student;
 
   const handleDownloadSinglePdf = async () => {
     setExporting(true);
@@ -35,6 +47,34 @@ export function CodePreviewModal({
       }
     } finally {
       setExporting(false);
+    }
+  };
+
+  const handleDownloadSinglePng = async () => {
+    setExportingPng(true);
+    try {
+      const dataUrl = await generateStudentOrLaptopCardPngDataUrl({
+        mode,
+        student: ownerStudent,
+        laptop: assignedLaptop,
+        schoolName: settings.schoolName,
+        academicYear: settings.academicYear,
+      });
+      if (!dataUrl) return;
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      if (mode === 'student' && student) {
+        link.download = `kartu-siswa-${student.student_code}-${student.name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')}.png`;
+      } else if (mode === 'laptop' && laptop) {
+        link.download = `gantungan-tas-${laptop.asset_code}.png`;
+      }
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setExportingPng(false);
     }
   };
 
@@ -51,16 +91,6 @@ export function CodePreviewModal({
       : mode === 'laptop' && laptop
       ? `${laptop.brand_model}`
       : '';
-
-  const assignedLaptop =
-    mode === 'student' && student
-      ? allLaptops.find((l) => l.assigned_student_id === student.id)
-      : laptop;
-
-  const ownerStudent =
-    mode === 'laptop' && laptop
-      ? allStudents.find((s) => s.id === laptop.assigned_student_id)
-      : student;
 
   return (
     <div
@@ -106,19 +136,32 @@ export function CodePreviewModal({
           </p>
         </div>
 
-        <div className="flex items-center justify-end gap-2.5 border-t border-slate-200 bg-white px-5 py-3.5">
+        <div className="flex flex-wrap items-center justify-end gap-2.5 border-t border-slate-200 bg-white px-5 py-3.5">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+            className="rounded-lg border border-slate-200 px-3.5 py-2 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50"
           >
             Tutup
           </button>
           <button
             type="button"
+            onClick={handleDownloadSinglePng}
+            disabled={exportingPng}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-bold text-emerald-800 transition-colors hover:bg-emerald-100 disabled:opacity-60"
+          >
+            {exportingPng ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <FileImage className="h-4 w-4" />
+            )}
+            Unduh PNG ({mode === 'student' ? 'Kartu' : 'Gantungan'})
+          </button>
+          <button
+            type="button"
             onClick={handleDownloadSinglePdf}
             disabled={exporting}
-            className="inline-flex items-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-800 disabled:opacity-60"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3.5 py-2 text-xs font-bold text-white transition-colors hover:bg-blue-800 disabled:opacity-60"
           >
             {exporting ? (
               <Loader2 className="h-4 w-4 animate-spin" />

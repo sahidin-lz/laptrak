@@ -839,7 +839,7 @@ export default function App() {
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <span className="truncate text-sm font-extrabold tracking-tight text-slate-900">
-                  Sistem Peminjaman Laptop Siswa
+                  Sistem manajemen pemakaian laptop siswa
                 </span>
                 {isAdmin && (
                   <span className="hidden rounded-md bg-indigo-100 px-2 py-0.5 text-[10px] font-extrabold text-indigo-800 sm:inline-block">
@@ -847,9 +847,11 @@ export default function App() {
                   </span>
                 )}
               </div>
-              <p className="truncate text-[11px] font-medium text-slate-500">
-                {isAdmin ? currentNav.breadcrumb : 'Halaman Depan Scan Harian & Kepulangan'}
-              </p>
+              {isAdmin && (
+                <p className="truncate text-[11px] font-medium text-slate-500">
+                  {currentNav.breadcrumb}
+                </p>
+              )}
             </div>
           </div>
 

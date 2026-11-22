@@ -1197,51 +1197,56 @@ export function ScanView({
           </div>
 
           <div className="space-y-5 p-5 sm:p-7">
-            {/* 2-Step Header: 1. Scan Kartu Siswa -> 2. Scan Tas Laptop */}
-            <div className="grid grid-cols-2 gap-3">
-              <div
-                className={`flex items-center justify-between rounded-2xl border-2 px-3.5 py-3 text-xs font-extrabold transition-all sm:px-4 sm:text-sm ${
-                  scanPhase === 'scan_card'
-                    ? 'border-blue-600 bg-blue-50 text-blue-950'
-                    : 'border-emerald-500 bg-emerald-50 text-emerald-900'
-                }`}
-              >
-                <span className="flex items-center gap-2 truncate">
-                  <UserCheck className="h-4 w-4 shrink-0" />
-                  <span className="truncate">1. Scan Kartu Siswa</span>
+            {/* Single Sequential Scan Indicator: Scan 1 (Kartu Siswa) -> Scan 2 (Gantungan Tas) */}
+            {scanPhase === 'scan_card' ? (
+              <div className="flex items-center justify-between rounded-2xl border-2 border-blue-600 bg-blue-50 px-4 py-3.5 text-blue-950 shadow-xs">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white">
+                    <UserCheck className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <p className="text-[11px] font-extrabold tracking-wider text-blue-700 uppercase">
+                      Scan Pertama · Kartu Siswa
+                    </p>
+                    <p className="text-xs font-extrabold sm:text-sm">
+                      Silakan Scan QR / Barcode Kartu Siswa (SIS-XXXX)
+                    </p>
+                  </div>
+                </div>
+                <span className="hidden rounded-lg bg-blue-600 px-2.5 py-1 text-[11px] font-extrabold text-white sm:inline-block">
+                  TAHAP 1
                 </span>
-                {scanPhase === 'scan_bag' && (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                )}
               </div>
-
-              <div
-                className={`flex items-center justify-between rounded-2xl border-2 px-3.5 py-3 text-xs font-extrabold transition-all sm:px-4 sm:text-sm ${
-                  scanPhase === 'scan_bag'
-                    ? 'border-blue-600 bg-blue-50 text-blue-950'
-                    : 'border-slate-200 bg-slate-50 text-slate-400'
-                }`}
-              >
-                <span className="flex items-center gap-2 truncate">
-                  <LaptopIcon className="h-4 w-4 shrink-0" />
-                  <span className="truncate">2. Scan Barcode Tas</span>
-                </span>
-                {scanPhase === 'scan_bag' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setScannedStudentId(null);
-                      setScanPhase('scan_card');
-                      setInlineScanError(null);
-                    }}
-                    className="inline-flex items-center gap-1 rounded-lg bg-rose-100 px-2 py-1 text-[11px] font-bold text-rose-700 hover:bg-rose-200"
-                  >
-                    <RotateCcw className="h-3 w-3" />
-                    Ulang
-                  </button>
-                )}
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-2xl border-2 border-indigo-600 bg-indigo-50 px-4 py-3.5 text-indigo-950 shadow-xs">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-indigo-600 text-white">
+                    <LaptopIcon className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <p className="flex items-center gap-1.5 text-[11px] font-extrabold tracking-wider text-emerald-700 uppercase">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                      Scan Pertama Selesai · Lanjut Scan Kedua (Gantungan Tas)
+                    </p>
+                    <p className="text-xs font-extrabold sm:text-sm">
+                      Sekarang Scan Barcode Gantungan Tas Laptop ({assignedLaptop ? assignedLaptop.asset_code : 'LAP-XXX'})
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScannedStudentId(null);
+                    setScanPhase('scan_card');
+                    setInlineScanError(null);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-100 px-3 py-1.5 text-xs font-extrabold text-rose-700 transition-colors hover:bg-rose-200"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  Ulang Scan Kartu
+                </button>
               </div>
-            </div>
+            )}
 
             {/* Responsive Split on Laptop / Stacked on HP when Student Card has been scanned */}
             <div

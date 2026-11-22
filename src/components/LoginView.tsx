@@ -47,8 +47,8 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
   const handleFirstRunClaim = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (password.length < 8) {
-      setError('Password Admin minimal 8 karakter.');
+    if (password.length < 6) {
+      setError('Password Admin minimal 6 karakter.');
       return;
     }
     setSubmitting(true);
@@ -169,13 +169,13 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
 
                   <div>
                     <label className="mb-1.5 block text-xs font-bold text-slate-700">
-                      Password Admin (Min. 8 Karakter)
+                      Password Admin (Min. 6 Karakter)
                     </label>
                     <div className="relative">
                       <KeyRound className="pointer-events-none absolute top-1/2 left-3.5 h-4 w-4 -translate-y-1/2 text-slate-400" />
                       <input
                         required
-                        minLength={8}
+                        minLength={6}
                         type={showPass ? 'text' : 'password'}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}

@@ -7,21 +7,50 @@ interface QrScannerBoxProps {
   paused?: boolean;
 }
 
+const CAMERA_AUTH_SESSION_KEY = 'laptrack_camera_authorized_v1';
+let sessionCameraAuthorized = false;
+
+function isCameraAuthorizedInSession(): boolean {
+  if (sessionCameraAuthorized) return true;
+  try {
+    return window.sessionStorage.getItem(CAMERA_AUTH_SESSION_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function setCameraAuthorizedInSession(authorized: boolean): void {
+  sessionCameraAuthorized = authorized;
+  try {
+    if (authorized) {
+      window.sessionStorage.setItem(CAMERA_AUTH_SESSION_KEY, '1');
+    } else {
+      window.sessionStorage.removeItem(CAMERA_AUTH_SESSION_KEY);
+    }
+  } catch {
+    // Ignore sessionStorage errors
+  }
+}
+
 export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
   const containerId = 'laptrack-camera-scanner';
   const scannerRef = useRef<Html5Qrcode | null>(null);
   const lastScanRef = useRef<{ text: string; time: number }>({ text: '', time: 0 });
   const pausedRef = useRef(paused);
   const onScanRef = useRef(onScan);
+  const mountedRef = useRef(true);
 
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
-  const [starting, setStarting] = useState(false);
+  const [starting, setStarting] = useState(() => isCameraAuthorizedInSession());
 
   pausedRef.current = paused;
   onScanRef.current = onScan;
 
-  const stopCamera = async () => {
+  const stopCamera = async (revokeSessionAuth = false) => {
+    if (revokeSessionAuth) {
+      setCameraAuthorizedInSession(false);
+    }
     if (scannerRef.current) {
       try {
         if (scannerRef.current.isScanning) {
@@ -33,13 +62,17 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
       }
       scannerRef.current = null;
     }
-    setCameraActive(false);
+    if (mountedRef.current) {
+      setCameraActive(false);
+    }
   };
 
   const startCamera = async () => {
-    setStarting(true);
-    setCameraError(null);
-    await stopCamera();
+    if (mountedRef.current) {
+      setStarting(true);
+      setCameraError(null);
+    }
+    await stopCamera(false);
 
     try {
       const scanner = new Html5Qrcode(containerId, {
@@ -78,21 +111,44 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
         }
       );
 
-      setCameraActive(true);
+      setCameraAuthorizedInSession(true);
+      if (mountedRef.current) {
+        setCameraActive(true);
+      }
     } catch {
-      setCameraError(
-        'Kamera tidak tersedia atau izin ditolak. Gunakan scanner barcode USB atau input kode manual di bawah.'
-      );
-      setCameraActive(false);
+      setCameraAuthorizedInSession(false);
+      if (mountedRef.current) {
+        setCameraError(
+          'Kamera tidak tersedia atau izin ditolak. Gunakan scanner barcode USB atau input kode manual di bawah.'
+        );
+        setCameraActive(false);
+      }
     } finally {
-      setStarting(false);
+      if (mountedRef.current) {
+        setStarting(false);
+      }
     }
   };
 
   useEffect(() => {
+    mountedRef.current = true;
+    if (isCameraAuthorizedInSession()) {
+      const timer = window.setTimeout(() => {
+        if (mountedRef.current) {
+          void startCamera();
+        }
+      }, 60);
+      return () => {
+        mountedRef.current = false;
+        window.clearTimeout(timer);
+        void stopCamera(false);
+      };
+    }
     return () => {
-      stopCamera();
+      mountedRef.current = false;
+      void stopCamera(false);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -100,7 +156,19 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
       <div className="relative flex min-h-[260px] flex-col items-center justify-center">
         <div id={containerId} className="w-full" />
 
-        {!cameraActive && (
+        {!cameraActive && starting && (
+          <div className="flex flex-col items-center justify-center px-6 py-10 text-center">
+            <RefreshCw className="mb-3 h-7 w-7 animate-spin text-blue-400" />
+            <p className="text-sm font-semibold text-white">
+              Menghubungkan Kamera Pemindai...
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              Kamera otomatis aktif selama halaman web belum ditutup.
+            </p>
+          </div>
+        )}
+
+        {!cameraActive && !starting && (
           <div className="flex flex-col items-center justify-center px-6 py-10 text-center">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-800 text-slate-300">
               {cameraError ? <CameraOff className="h-6 w-6" /> : <Camera className="h-6 w-6" />}
@@ -110,7 +178,7 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
             </p>
             <p className="mt-1 max-w-xs text-xs leading-relaxed text-slate-400">
               {cameraError ||
-                'Aktifkan kamera untuk memindai QR Kartu Siswa maupun Barcode Code-128 pada Gantungan Tas.'}
+                'Aktifkan kamera satu kali di awal untuk memindai QR Kartu Siswa maupun Barcode Gantungan Tas.'}
             </p>
             <button
               type="button"
@@ -118,12 +186,8 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
               disabled={starting}
               className="mt-4 inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:opacity-60"
             >
-              {starting ? (
-                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Camera className="h-3.5 w-3.5" />
-              )}
-              {starting ? 'Menghubungkan Kamera...' : 'Aktifkan Kamera'}
+              <Camera className="h-3.5 w-3.5" />
+              Aktifkan Kamera
             </button>
           </div>
         )}
@@ -136,7 +200,7 @@ export function QrScannerBox({ onScan, paused = false }: QrScannerBoxProps) {
           </span>
           <button
             type="button"
-            onClick={stopCamera}
+            onClick={() => stopCamera(true)}
             className="inline-flex items-center gap-1.5 rounded-md bg-slate-800 px-2.5 py-1 text-xs font-semibold text-slate-200 transition-colors hover:bg-slate-700"
           >
             <CameraOff className="h-3.5 w-3.5" />

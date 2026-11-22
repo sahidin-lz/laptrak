@@ -60,7 +60,11 @@ import { SUPABASE_SQL_SCHEMA } from '../lib/supabaseSql';
 import { CodePreviewModal } from './CodePreviewModal';
 import { SuspendStudentModal } from './SuspendStudentModal';
 import { TeacherBarcodeModal } from './TeacherBarcodeModal';
-import { getInitials } from '../lib/barcode';
+import {
+  generateAllStaffCardsSheetPngDataUrl,
+  generateStaffCardPngDataUrl,
+  getInitials,
+} from '../lib/barcode';
 
 interface MasterViewProps {
   currentUser: AuthUser;
@@ -1704,18 +1708,53 @@ export function MasterView({
                     Daftar Data Pegawai &amp; Token Kode Barcode Login Guru ({filteredStaff.length})
                   </h3>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    Klik <strong>Barcode</strong> untuk menampilkan/mencetak Kartu Barcode Login Guru Piket, atau <strong>Edit</strong> untuk mengubah nama &amp; token.
+                    Klik <strong>Kartu PNG</strong> untuk mengunduh Kartu ID Barcode Login resolusi tinggi, atau <strong>Unduh Semua Kartu (.PNG)</strong>.
                   </p>
                 </div>
-                <div className="relative w-full sm:w-56">
-                  <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Cari nama pegawai, token PKT..."
-                    className="w-full rounded-xl border border-slate-200 py-1.5 pr-3 pl-8 text-xs outline-none focus:border-blue-600"
-                  />
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const list = filteredStaff.map((s) => ({
+                        id: s.id,
+                        name: s.name,
+                        role: s.role,
+                        wilayah: s.wilayah,
+                        demo_token: s.piket_token,
+                      }));
+                      const sheetUrl = await generateAllStaffCardsSheetPngDataUrl(
+                        list,
+                        printSettings.schoolName
+                      );
+                      if (sheetUrl) {
+                        const link = document.createElement('a');
+                        link.href = sheetUrl;
+                        link.download = `lembar-semua-kartu-guru-dan-admin-${list.length}-kartu.png`;
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        setFormMsg({
+                          type: 'ok',
+                          text: `Lembar Gabungan (${list.length} Kartu Guru Piket & Admin) resolusi tinggi berhasil diunduh dalam format .PNG.`,
+                        });
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-3 py-1.5 text-xs font-extrabold text-white shadow-2xs transition-all hover:from-emerald-700 hover:to-teal-700"
+                    title="Unduh lembar PNG berisi semua kartu Guru Piket & Admin"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Unduh Semua Kartu (.PNG)
+                  </button>
+                  <div className="relative w-full sm:w-52">
+                    <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      placeholder="Cari nama pegawai, token PKT..."
+                      className="w-full rounded-xl border border-slate-200 py-1.5 pr-3 pl-8 text-xs outline-none focus:border-blue-600"
+                    />
+                  </div>
                 </div>
               </div>
               <div className="overflow-x-auto">
@@ -1723,7 +1762,7 @@ export function MasterView({
                   <thead>
                     <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
                       <th className="px-5 py-3 font-bold">Nama Pegawai / Guru</th>
-                      <th className="px-4 py-3 font-bold">Token Kode Barcode Login</th>
+                      <th className="px-4 py-3 font-bold">Token &amp; Unduh Kartu Barcode (.PNG)</th>
                       <th className="px-4 py-3 font-bold">Peran &amp; Wilayah</th>
                       <th className="px-4 py-3 font-bold">Status</th>
                       <th className="px-5 py-3 text-right font-bold">CRUD &amp; Kartu Barcode</th>
@@ -1744,7 +1783,7 @@ export function MasterView({
                             <p className="font-mono text-[11px] text-slate-500">{stf.username}</p>
                           </td>
                           <td className="px-4 py-3">
-                            <div className="inline-flex items-center gap-1.5">
+                            <div className="inline-flex flex-wrap items-center gap-1.5">
                               <span className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1 font-mono text-xs font-extrabold text-amber-900">
                                 <KeyRound className="h-3 w-3 text-amber-600" />
                                 {stf.piket_token}
@@ -1753,10 +1792,47 @@ export function MasterView({
                                 type="button"
                                 onClick={() => setTeacherBarcodeStaffId(stf.id)}
                                 className="inline-flex items-center gap-1 rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1 text-[11px] font-bold text-blue-700 hover:bg-blue-100"
-                                title="Lihat & Unduh Kartu Barcode Login Guru Piket"
+                                title="Lihat Pratinjau & Studio Kartu Barcode Login"
                               >
                                 <QrCode className="h-3 w-3" />
-                                Barcode Login
+                                Lihat Kartu
+                              </button>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  const pngUrl = await generateStaffCardPngDataUrl(
+                                    {
+                                      id: stf.id,
+                                      name: stf.name,
+                                      role: stf.role,
+                                      wilayah: stf.wilayah,
+                                      demo_token: stf.piket_token,
+                                    },
+                                    printSettings.schoolName
+                                  );
+                                  if (pngUrl) {
+                                    const roleSlug = stf.role === 'admin' ? 'admin' : 'guru-piket';
+                                    const cleanName = stf.name
+                                      .toLowerCase()
+                                      .replace(/[^a-z0-9]+/g, '-')
+                                      .replace(/^-|-$/g, '');
+                                    const link = document.createElement('a');
+                                    link.href = pngUrl;
+                                    link.download = `kartu-${roleSlug}-${stf.piket_token}-${cleanName}.png`;
+                                    document.body.appendChild(link);
+                                    link.click();
+                                    document.body.removeChild(link);
+                                    setFormMsg({
+                                      type: 'ok',
+                                      text: `Kartu PNG ${stf.name} (${stf.piket_token}) berhasil diunduh.`,
+                                    });
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100"
+                                title="Unduh langsung Kartu PNG Guru/Admin ini"
+                              >
+                                <Download className="h-3 w-3" />
+                                Kartu .PNG
                               </button>
                               <button
                                 type="button"
@@ -2198,6 +2274,7 @@ export function MasterView({
             demo_token: stf.piket_token,
           }))}
           initialPiketId={teacherBarcodeStaffId}
+          schoolName={printSettings.schoolName}
           onClose={() => setTeacherBarcodeStaffId(null)}
         />
       )}
