@@ -156,6 +156,11 @@ export default function App() {
         setAuthToken(null);
         setUser(null);
       }
+      // Guarantee state is never null even on static hosting (Vercel)
+      const fallbackState = await api.getState().catch(() => null);
+      if (fallbackState) {
+        setState(fallbackState);
+      }
     } finally {
       setLoadingState(false);
     }
@@ -260,7 +265,18 @@ export default function App() {
   }
 
   if (!state) {
-    return null;
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-gradient-to-br from-indigo-950 via-blue-900 to-violet-950 p-6 text-center text-white">
+        <p className="text-sm font-bold">Menyiapkan Database Lokal &amp; Firebase...</p>
+        <button
+          type="button"
+          onClick={() => initializeApp()}
+          className="rounded-xl bg-amber-400 px-4 py-2 text-xs font-extrabold text-slate-950 hover:bg-amber-300"
+        >
+          Muat Ulang Aplikasi
+        </button>
+      </div>
+    );
   }
 
   const activeBorrowedCount = state.laptops.filter((l) => l.status === 'borrowed').length;

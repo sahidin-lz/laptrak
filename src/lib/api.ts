@@ -14,8 +14,10 @@ import {
   TransactionType,
   Wilayah,
 } from '../types/models';
+import { localBackend } from './localBackend';
 
 let authTokenMemory: string | null = null;
+let useLocalServerlessFallback = false;
 
 export function setAuthToken(token: string | null): void {
   authTokenMemory = token;
@@ -45,7 +47,15 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
+async function requestWithFallback<T>(
+  url: string,
+  options: RequestInit,
+  fallbackFn: () => Promise<T>
+): Promise<T> {
+  if (useLocalServerlessFallback) {
+    return fallbackFn();
+  }
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Requested-With': 'LapTrackClient',
@@ -55,22 +65,53 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     headers.Authorization = `Bearer ${authTokenMemory}`;
   }
 
-  const res = await fetch(url, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new ApiError(
-      data.error || 'Terjadi kesalahan saat menghubungi server.',
-      res.status,
-      data.code,
-      data.correctedSession,
-      data.correctedLabel
-    );
+  try {
+    const res = await fetch(url, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+
+    const contentType = res.headers.get('content-type') || '';
+
+    // On static hosts like Vercel (laptrak.vercel.app), /api/* either returns 404/405
+    // or returns text/html (index.html SPA rewrite) instead of application/json.
+    if (
+      res.status === 404 ||
+      res.status === 405 ||
+      res.status === 502 ||
+      res.status === 503 ||
+      res.status === 504 ||
+      !contentType.includes('application/json')
+    ) {
+      useLocalServerlessFallback = true;
+      return fallbackFn();
+    }
+
+    const data = await res.json().catch(() => null);
+    if (!data) {
+      useLocalServerlessFallback = true;
+      return fallbackFn();
+    }
+
+    if (!res.ok) {
+      throw new ApiError(
+        data.error || 'Terjadi kesalahan saat menghubungi server.',
+        res.status,
+        data.code,
+        data.correctedSession,
+        data.correctedLabel
+      );
+    }
+    return data as T;
+  } catch (err) {
+    if (err instanceof ApiError) {
+      throw err;
+    }
+    // Network error or static hosting without Express server -> seamlessly switch to local + Firebase mode
+    useLocalServerlessFallback = true;
+    return fallbackFn();
   }
-  return data as T;
 }
 
 export interface AuthStatusResponse {
@@ -98,58 +139,95 @@ export interface BorrowPayload {
 }
 
 export const api = {
-  getAuthStatus: () => request<AuthStatusResponse>('/api/auth/status'),
+  getAuthStatus: () =>
+    requestWithFallback<AuthStatusResponse>('/api/auth/status', {}, () =>
+      localBackend.getAuthStatus()
+    ),
 
-  getMe: () => request<{ user: AuthUser | null }>('/api/auth/me'),
+  getMe: () =>
+    requestWithFallback<{ user: AuthUser | null }>('/api/auth/me', {}, () =>
+      localBackend.getMe()
+    ),
 
   claimAdmin: (payload: { username: string; password: string; piketPassword?: string }) =>
-    request<LoginResponse>('/api/auth/claim-admin', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<LoginResponse>(
+      '/api/auth/claim-admin',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.claimAdmin(payload)
+    ),
 
   login: (username: string, password: string) =>
-    request<LoginResponse>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password }),
-    }),
+    requestWithFallback<LoginResponse>(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      },
+      () => localBackend.login(username, password)
+    ),
 
-  logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  logout: () =>
+    requestWithFallback<{ ok: boolean }>(
+      '/api/auth/logout',
+      { method: 'POST' },
+      () => localBackend.logout()
+    ),
 
-  getState: () => request<AppStatePayload>('/api/state'),
+  getState: () =>
+    requestWithFallback<AppStatePayload>('/api/state', {}, () => localBackend.getState()),
 
   hydrateState: (bundle: Partial<AppStatePayload>) =>
-    request<AppStatePayload>('/api/state/hydrate', {
-      method: 'POST',
-      body: JSON.stringify({ bundle }),
-    }),
+    requestWithFallback<AppStatePayload>(
+      '/api/state/hydrate',
+      {
+        method: 'POST',
+        body: JSON.stringify({ bundle }),
+      },
+      () => localBackend.hydrateState(bundle)
+    ),
 
   updateKioskState: (patch: Partial<KioskPersistedState>) =>
-    request<{ kioskState: KioskPersistedState }>('/api/kiosk-state', {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    }),
+    requestWithFallback<{ kioskState: KioskPersistedState }>(
+      '/api/kiosk-state',
+      {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      },
+      () => localBackend.updateKioskState(patch)
+    ),
 
   verifyPiketToken: (piketId: string, piketToken: string) =>
-    request<{ ok: boolean; piket: PiketOption }>('/api/piket/verify-token', {
-      method: 'POST',
-      body: JSON.stringify({ piketId, piketToken }),
-    }),
+    requestWithFallback<{ ok: boolean; piket: PiketOption }>(
+      '/api/piket/verify-token',
+      {
+        method: 'POST',
+        body: JSON.stringify({ piketId, piketToken }),
+      },
+      () => localBackend.verifyPiketToken(piketId, piketToken)
+    ),
 
   loginPiketByBarcode: (barcode: string) =>
-    request<{ ok: boolean; ticket: PiketTicket; kioskState: KioskPersistedState }>(
+    requestWithFallback<{ ok: boolean; ticket: PiketTicket; kioskState: KioskPersistedState }>(
       '/api/piket/barcode-login',
       {
         method: 'POST',
         body: JSON.stringify({ barcode }),
-      }
+      },
+      () => localBackend.loginPiketByBarcode(barcode)
     ),
 
   borrowLaptop: (payload: BorrowPayload) =>
-    request<{ transaction: Transaction; state: AppStatePayload }>('/api/transactions/borrow', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ transaction: Transaction; state: AppStatePayload }>(
+      '/api/transactions/borrow',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.borrowLaptop(payload)
+    ),
 
   returnLaptop: (
     studentId: string,
@@ -158,7 +236,7 @@ export const api = {
     piketId?: string,
     piketToken?: string
   ) =>
-    request<{
+    requestWithFallback<{
       transaction: Transaction | null;
       isLate: boolean;
       lateMinutes: number;
@@ -166,10 +244,21 @@ export const api = {
       studentLateCount: number;
       newlySuspended: boolean;
       state: AppStatePayload;
-    }>('/api/transactions/return', {
-      method: 'POST',
-      body: JSON.stringify({ studentId, laptopId, simulateLateMinutes, piketId, piketToken }),
-    }),
+    }>(
+      '/api/transactions/return',
+      {
+        method: 'POST',
+        body: JSON.stringify({ studentId, laptopId, simulateLateMinutes, piketId, piketToken }),
+      },
+      () =>
+        localBackend.returnLaptop(
+          studentId,
+          laptopId,
+          simulateLateMinutes,
+          piketId,
+          piketToken
+        )
+    ),
 
   addStudent: (payload: {
     name: string;
@@ -177,12 +266,13 @@ export const api = {
     wilayah: Wilayah;
     photo_url: string | null;
   }) =>
-    request<{ student: { student_code: string; name: string }; state: AppStatePayload }>(
+    requestWithFallback<{ student: { student_code: string; name: string }; state: AppStatePayload }>(
       '/api/students',
       {
         method: 'POST',
         body: JSON.stringify(payload),
-      }
+      },
+      () => localBackend.addStudent(payload)
     ),
 
   updateStudent: (
@@ -194,10 +284,14 @@ export const api = {
       photo_url?: string | null;
     }
   ) =>
-    request<{ state: AppStatePayload }>(`/api/students/${studentId}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/students/${studentId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.updateStudent(studentId, payload)
+    ),
 
   bulkAddStudents: (
     rows: Array<{
@@ -209,43 +303,63 @@ export const api = {
       photo_url?: string | null;
     }>
   ) =>
-    request<{
+    requestWithFallback<{
       createdStudents: number;
       createdLaptops: number;
       state: AppStatePayload;
-    }>('/api/students/bulk', {
-      method: 'POST',
-      body: JSON.stringify({ rows }),
-    }),
+    }>(
+      '/api/students/bulk',
+      {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      },
+      () => localBackend.bulkAddStudents(rows)
+    ),
 
   suspendStudent: (
     studentId: string,
     payload: { suspended_until: string; reason?: string }
   ) =>
-    request<{ state: AppStatePayload }>(`/api/students/${studentId}/suspend`, {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/students/${studentId}/suspend`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.suspendStudent(studentId, payload)
+    ),
 
   resetStudentSanction: (studentId: string) =>
-    request<{ state: AppStatePayload }>(`/api/students/${studentId}/reset-sanction`, {
-      method: 'POST',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/students/${studentId}/reset-sanction`,
+      {
+        method: 'POST',
+      },
+      () => localBackend.resetStudentSanction(studentId)
+    ),
 
   deleteStudent: (studentId: string) =>
-    request<{ state: AppStatePayload }>(`/api/students/${studentId}`, {
-      method: 'DELETE',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/students/${studentId}`,
+      {
+        method: 'DELETE',
+      },
+      () => localBackend.deleteStudent(studentId)
+    ),
 
   addLaptop: (payload: {
     asset_code: string;
     brand_model: string;
     assigned_student_id: string | null;
   }) =>
-    request<{ state: AppStatePayload }>('/api/laptops', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      '/api/laptops',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.addLaptop(payload)
+    ),
 
   updateLaptop: (
     laptopId: string,
@@ -255,10 +369,14 @@ export const api = {
       assigned_student_id: string | null;
     }
   ) =>
-    request<{ state: AppStatePayload }>(`/api/laptops/${laptopId}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/laptops/${laptopId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.updateLaptop(laptopId, payload)
+    ),
 
   bulkAddLaptops: (
     rows: Array<{
@@ -267,31 +385,47 @@ export const api = {
       student_code?: string;
     }>
   ) =>
-    request<{
+    requestWithFallback<{
       createdLaptops: number;
       updatedLaptops: number;
       state: AppStatePayload;
-    }>('/api/laptops/bulk', {
-      method: 'POST',
-      body: JSON.stringify({ rows }),
-    }),
+    }>(
+      '/api/laptops/bulk',
+      {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      },
+      () => localBackend.bulkAddLaptops(rows)
+    ),
 
   assignLaptop: (laptopId: string, studentId: string | null) =>
-    request<{ state: AppStatePayload }>(`/api/laptops/${laptopId}/assign`, {
-      method: 'PATCH',
-      body: JSON.stringify({ studentId }),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/laptops/${laptopId}/assign`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ studentId }),
+      },
+      () => localBackend.assignLaptop(laptopId, studentId)
+    ),
 
   deleteLaptop: (laptopId: string) =>
-    request<{ state: AppStatePayload }>(`/api/laptops/${laptopId}`, {
-      method: 'DELETE',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/laptops/${laptopId}`,
+      {
+        method: 'DELETE',
+      },
+      () => localBackend.deleteLaptop(laptopId)
+    ),
 
   updateDailySessions: (sessions: DailySessionConfig[]) =>
-    request<{ state: AppStatePayload }>('/api/settings/daily-sessions', {
-      method: 'PATCH',
-      body: JSON.stringify({ sessions }),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      '/api/settings/daily-sessions',
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ sessions }),
+      },
+      () => localBackend.updateDailySessions(sessions)
+    ),
 
   addSchedule: (payload: {
     purpose: LaptopPurpose;
@@ -300,10 +434,14 @@ export const api = {
     start_time: string;
     end_time: string;
   }) =>
-    request<{ state: AppStatePayload }>('/api/schedules', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      '/api/schedules',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.addSchedule(payload)
+    ),
 
   updateSchedule: (
     scheduleId: string,
@@ -315,20 +453,32 @@ export const api = {
       end_time: string;
     }
   ) =>
-    request<{ state: AppStatePayload }>(`/api/schedules/${scheduleId}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/schedules/${scheduleId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.updateSchedule(scheduleId, payload)
+    ),
 
   toggleSchedule: (scheduleId: string) =>
-    request<{ state: AppStatePayload }>(`/api/schedules/${scheduleId}/toggle`, {
-      method: 'PATCH',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/schedules/${scheduleId}/toggle`,
+      {
+        method: 'PATCH',
+      },
+      () => localBackend.toggleSchedule(scheduleId)
+    ),
 
   deleteSchedule: (scheduleId: string) =>
-    request<{ state: AppStatePayload }>(`/api/schedules/${scheduleId}`, {
-      method: 'DELETE',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/schedules/${scheduleId}`,
+      {
+        method: 'DELETE',
+      },
+      () => localBackend.deleteSchedule(scheduleId)
+    ),
 
   addStaff: (payload: {
     name: string;
@@ -338,10 +488,14 @@ export const api = {
     wilayah: StaffWilayah;
     piket_token?: string;
   }) =>
-    request<{ state: AppStatePayload }>('/api/staff', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      '/api/staff',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.addStaff(payload)
+    ),
 
   updateStaff: (
     staffId: string,
@@ -354,10 +508,14 @@ export const api = {
       password?: string;
     }
   ) =>
-    request<{ state: AppStatePayload }>(`/api/staff/${staffId}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/staff/${staffId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.updateStaff(staffId, payload)
+    ),
 
   bulkAddStaff: (
     rows: Array<{
@@ -369,39 +527,63 @@ export const api = {
       password?: string;
     }>
   ) =>
-    request<{
+    requestWithFallback<{
       createdStaff: number;
       updatedStaff: number;
       state: AppStatePayload;
-    }>('/api/staff/bulk', {
-      method: 'POST',
-      body: JSON.stringify({ rows }),
-    }),
+    }>(
+      '/api/staff/bulk',
+      {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      },
+      () => localBackend.bulkAddStaff(rows)
+    ),
 
   updateStaffToken: (staffId: string, piket_token?: string) =>
-    request<{ state: AppStatePayload }>(`/api/staff/${staffId}/token`, {
-      method: 'PATCH',
-      body: JSON.stringify({ piket_token }),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/staff/${staffId}/token`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ piket_token }),
+      },
+      () => localBackend.updateStaffToken(staffId, piket_token)
+    ),
 
   toggleStaff: (staffId: string) =>
-    request<{ state: AppStatePayload }>(`/api/staff/${staffId}/toggle`, {
-      method: 'PATCH',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/staff/${staffId}/toggle`,
+      {
+        method: 'PATCH',
+      },
+      () => localBackend.toggleStaff(staffId)
+    ),
 
   deleteStaff: (staffId: string) =>
-    request<{ state: AppStatePayload }>(`/api/staff/${staffId}`, {
-      method: 'DELETE',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      `/api/staff/${staffId}`,
+      {
+        method: 'DELETE',
+      },
+      () => localBackend.deleteStaff(staffId)
+    ),
 
   updatePrintSettings: (patch: Partial<PrintSettings>) =>
-    request<{ state: AppStatePayload }>('/api/settings/print', {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      '/api/settings/print',
+      {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      },
+      () => localBackend.updatePrintSettings(patch)
+    ),
 
   resetDemo: () =>
-    request<{ state: AppStatePayload }>('/api/admin/reset-demo', {
-      method: 'POST',
-    }),
+    requestWithFallback<{ state: AppStatePayload }>(
+      '/api/admin/reset-demo',
+      {
+        method: 'POST',
+      },
+      () => localBackend.resetDemo()
+    ),
 };
