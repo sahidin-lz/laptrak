@@ -1,0 +1,182 @@
+{
+  "entities": {
+    "KioskBundle": {
+      "title": "KioskBundle",
+      "description": "Quota-optimized aggregated school laptop management dataset stored as a single document to minimize daily Firestore read and write operations.",
+      "type": "object",
+      "properties": {
+        "bundleId": {
+          "type": "string",
+          "description": "Unique identifier for the bundle document.",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the authenticated administrator or school operator who owns this bundle.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "schoolName": {
+          "type": "string",
+          "description": "Name of the school.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "payloadJson": {
+          "type": "string",
+          "description": "Serialized state snapshot of students, laptops, schedules, dailySessions, transactions, and printSettings.",
+          "minLength": 2,
+          "maxLength": 900000
+        },
+        "version": {
+          "type": "integer",
+          "description": "Monotonically increasing revision number for conflict-free quota-saving sync."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "bundleId",
+        "ownerId",
+        "schoolName",
+        "payloadJson",
+        "version",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TransactionAudit": {
+      "title": "TransactionAudit",
+      "description": "Individual laptop borrow or return audit record owned by the authenticated school operator.",
+      "type": "object",
+      "properties": {
+        "txId": {
+          "type": "string",
+          "description": "Transaction identifier.",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the authenticated user recording the audit entry.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentCode": {
+          "type": "string",
+          "description": "Student unique card code (SIS-XXXX).",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "studentName": {
+          "type": "string",
+          "description": "Student full name.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "assetCode": {
+          "type": "string",
+          "description": "Laptop bag barcode asset code (LAP-XXX).",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "transactionType": {
+          "type": "string",
+          "enum": ["harian", "pulang"],
+          "description": "Whether the scan is daily session usage or home leave (kepulangan).",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "returned"],
+          "description": "Borrowing status; changes to returned when scanned back.",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "purpose": {
+          "type": "string",
+          "description": "Session label or purpose description.",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "piketName": {
+          "type": "string",
+          "description": "Duty teacher name.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "txId",
+        "ownerId",
+        "studentCode",
+        "studentName",
+        "assetCode",
+        "transactionType",
+        "status",
+        "purpose",
+        "piketName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Read-only marker document identifying a trusted administrator UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "UID of the administrator.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        }
+      },
+      "required": ["uid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/kiosk_bundles/{bundleId}": {
+      "schema": { "$ref": "#/entities/KioskBundle" },
+      "description": "Stores quota-optimized consolidated school laptop management snapshots so full app hydration costs 1 read instead of hundreds."
+    },
+    "/transaction_audits/{txId}": {
+      "schema": { "$ref": "#/entities/TransactionAudit" },
+      "description": "Stores individual laptop borrowing and return audit records."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Trusted administrator lookup collection."
+    }
+  }
+}

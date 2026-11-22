@@ -1,0 +1,6 @@
+{
+  "name": "LapTrack Sekolah — Kartu Siswa, Gantungan Barcode & Validasi Laptop",
+  "description": "Sistem peminjaman laptop siswa dengan validasi jadwal, kode unik otomatis, pemindai QR/Barcode, serta cetak PDF kartu siswa dan gantungan barcode tas laptop.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

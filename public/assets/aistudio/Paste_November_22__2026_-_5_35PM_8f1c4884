@@ -1,0 +1,1248 @@
+Untuk mengakomodasi **kode unik otomatis (tanpa NISN)**, **upload template CSV siswa**, serta **validasi ganda (kecocokan profil + kesesuaian jadwal & peruntukan)**, berikut pembaruan arsitektur database dan kode aplikasinya.
+
+### Logika Validasi Baru
+
+1. **Kode Unik Otomatis:** Database Supabase menggunakan *Sequence* otomatis (`SIS-0001`, `SIS-0002`, dst.). Baik saat input satu per satu maupun *upload* massal via template CSV, kode unik langsung terbuat otomatis tanpa perlu mengisi NISN.
+2. **Validasi Jadwal & Peruntukan:** Saat siswa memindai kartu untuk **mengambil** laptop, sistem otomatis mengecek hari, jam saat ini, dan kecocokan kelas terhadap tabel `schedules` (*Bimbel Kelas 10, Bimbel Kelas 11, Bimbel Kelas 12, SUGT, Kegiatan Lainnya*).
+* **Di luar jadwal:** Tombol/proses pengambilan **diblokir otomatis** dengan layar merah + *buzzer* error.
+* **Pengembalian:** Tetap diizinkan kapan saja (tidak diblokir jadwal) agar siswa yang terlambat mengembalikan tetap bisa tercatat.
+
+
+
+---
+
+## 1. Pembaruan Struktur Database SQL (Supabase)
+
+Jalankan skrip ini di **SQL Editor** Supabase (skrip ini akan mengganti tabel lama dengan struktur baru yang mendukung kode otomatis dan jadwal):
+
+```sql
+-- Bersihkan tabel lama jika sudah pernah dibuat sebelumnya
+DROP TABLE IF EXISTS transactions CASCADE;
+DROP TABLE IF EXISTS laptops CASCADE;
+DROP TABLE IF EXISTS students CASCADE;
+DROP TABLE IF EXISTS schedules CASCADE;
+DROP SEQUENCE IF EXISTS student_code_seq;
+
+-- Sequence untuk membuat Kode Unik Siswa otomatis (SIS-0001, SIS-0002, ...)
+CREATE SEQUENCE student_code_seq START 1;
+
+-- 1. Tabel Siswa (Tanpa NISN, menggunakan student_code otomatis)
+CREATE TABLE students (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_code TEXT UNIQUE NOT NULL DEFAULT ('SIS-' || lpad(nextval('student_code_seq')::text, 4, '0')),
+  name TEXT NOT NULL,
+  class TEXT NOT NULL,
+  photo_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 2. Tabel Laptop (Terhubung 1-ke-1 dengan siswa pemilik)
+CREATE TABLE laptops (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  asset_code TEXT UNIQUE NOT NULL,
+  brand_model TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'borrowed')),
+  assigned_student_id UUID UNIQUE REFERENCES students(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. Tabel Jadwal & Peruntukan Pemakaian
+CREATE TABLE schedules (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  purpose TEXT NOT NULL CHECK (
+    purpose IN ('Bimbel Kelas 10', 'Bimbel Kelas 11', 'Bimbel Kelas 12', 'SUGT', 'Kegiatan Lainnya')
+  ),
+  target_class TEXT NOT NULL, -- Contoh: '10', '11', '12', '10 IPA 1', atau 'SEMUA'
+  day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6), -- 0=Minggu, 1=Senin ... 6=Sabtu
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 4. Tabel Transaksi (Mencatat peruntukan dari jadwal yang cocok)
+CREATE TABLE transactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  laptop_id UUID NOT NULL REFERENCES laptops(id) ON DELETE CASCADE,
+  purpose TEXT NOT NULL DEFAULT 'Kegiatan Lainnya',
+  borrow_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  return_time TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'returned'))
+);
+
+-- Nonaktifkan RLS untuk akses langsung via Anon Key
+ALTER TABLE students DISABLE ROW LEVEL SECURITY;
+ALTER TABLE laptops DISABLE ROW LEVEL SECURITY;
+ALTER TABLE schedules DISABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions DISABLE ROW LEVEL SECURITY;
+
+-- ==========================================
+-- DATA DUMMY PENGUJIAN
+-- ==========================================
+INSERT INTO students (name, class, photo_url) VALUES
+  ('Ahmad Fauzi', '10 IPA 1', 'https://api.dicebear.com/9.x/avataaars/svg?seed=Ahmad'),
+  ('Siti Aminah', '11 IPS 2', 'https://api.dicebear.com/9.x/avataaars/svg?seed=Siti'),
+  ('Budi Santoso', '12 IPA 1', 'https://api.dicebear.com/9.x/avataaars/svg?seed=Budi');
+
+INSERT INTO laptops (asset_code, brand_model, status, assigned_student_id) VALUES
+  ('LAP-001', 'Lenovo ThinkPad T480', 'available', (SELECT id FROM students WHERE student_code = 'SIS-0001')),
+  ('LAP-002', 'Asus Vivobook 14', 'available', (SELECT id FROM students WHERE student_code = 'SIS-0002')),
+  ('LAP-003', 'HP ProBook 440 G8', 'available', (SELECT id FROM students WHERE student_code = 'SIS-0003'));
+
+-- Contoh Jadwal (Hari Senin=1, Minggu=0)
+INSERT INTO schedules (purpose, target_class, day_of_week, start_time, end_time) VALUES
+  ('Bimbel Kelas 10', '10', 1, '15:30:00', '17:30:00'),
+  ('Bimbel Kelas 11', '11', 2, '15:30:00', '17:30:00'),
+  ('Bimbel Kelas 12', '12', 3, '15:30:00', '17:30:00'),
+  ('SUGT', 'SEMUA', 6, '08:00:00', '12:00:00'),
+  ('Kegiatan Lainnya', 'SEMUA', 0, '08:00:00', '21:00:00');
+
+```
+
+---
+
+## 2. Pembaruan Tipe Data (`lib/supabase.ts`)
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+export const LAPTOP_PURPOSES = [
+  'Bimbel Kelas 10',
+  'Bimbel Kelas 11',
+  'Bimbel Kelas 12',
+  'SUGT',
+  'Kegiatan Lainnya',
+] as const;
+
+export type LaptopPurpose = (typeof LAPTOP_PURPOSES)[number];
+
+export const DAYS_ID = [
+  'Minggu',
+  'Senin',
+  'Selasa',
+  'Rabu',
+  'Kamis',
+  'Jumat',
+  'Sabtu',
+];
+
+export interface Student {
+  id: string;
+  student_code: string;
+  name: string;
+  class: string;
+  photo_url: string | null;
+  created_at?: string;
+}
+
+export interface Laptop {
+  id: string;
+  asset_code: string;
+  brand_model: string;
+  status: 'available' | 'borrowed';
+  assigned_student_id: string | null;
+  students?: Student | null;
+}
+
+export interface Schedule {
+  id: string;
+  purpose: LaptopPurpose;
+  target_class: string;
+  day_of_week: number;
+  start_time: string;
+  end_time: string;
+  is_active: boolean;
+}
+
+export interface Transaction {
+  id: string;
+  student_id: string;
+  laptop_id: string;
+  purpose: string;
+  borrow_time: string;
+  return_time: string | null;
+  status: 'active' | 'returned';
+  students?: Student;
+  laptops?: Laptop;
+}
+
+```
+
+---
+
+## 3. Halaman Scan dengan Validasi Profil & Jadwal (`app/page.tsx`)
+
+Saat kartu siswa (`SIS-0001`) dipindai, aplikasi langsung mengecek apakah saat ini masuk dalam jadwal yang diizinkan untuk kelas siswa tersebut. Jika tidak sesuai jadwal, proses pengambilan laptop otomatis diblokir.
+
+```tsx
+'use client';
+
+import { useState, useCallback } from 'react';
+import {
+  CheckCircle2,
+  XCircle,
+  RotateCcw,
+  UserCheck,
+  Laptop as LaptopIcon,
+  Keyboard,
+  ShieldAlert,
+  CalendarCheck,
+  CalendarX,
+} from 'lucide-react';
+import QrScanner from '@/components/QrScanner';
+import { supabase, Student, Laptop, Schedule, DAYS_ID } from '@/lib/supabase';
+import { playFeedback } from '@/lib/sound';
+
+type AlertState = {
+  type: 'borrowed' | 'returned' | 'error';
+  title: string;
+  message: string;
+} | null;
+
+// Fungsi bantu: cek kecocokan jadwal saat ini dengan kelas siswa
+function findMatchingSchedule(schedules: Schedule[], studentClass: string): Schedule | null {
+  const now = new Date();
+  const currentDay = now.getDay(); // 0-6
+  const currentTime = now.toTimeString().slice(0, 8); // "HH:MM:SS"
+  const normClass = studentClass.trim().toUpperCase();
+
+  return (
+    schedules.find((sch) => {
+      if (!sch.is_active || sch.day_of_week !== currentDay) return false;
+      if (currentTime < sch.start_time || currentTime > sch.end_time) return false;
+
+      const target = sch.target_class.trim().toUpperCase();
+      if (target === 'SEMUA' || target === 'ALL') return true;
+      return normClass.startsWith(target) || normClass.includes(target);
+    }) || null
+  );
+}
+
+export default function ScanPage() {
+  const [step, setStep] = useState<1 | 2>(1);
+  const [scannedStudent, setScannedStudent] = useState<Student | null>(null);
+  const [assignedLaptop, setAssignedLaptop] = useState<Laptop | null>(null);
+  const [activeSchedule, setActiveSchedule] = useState<Schedule | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [alert, setAlert] = useState<AlertState>(null);
+  const [manualCode, setManualCode] = useState('');
+
+  const resetProcess = useCallback(() => {
+    setStep(1);
+    setScannedStudent(null);
+    setAssignedLaptop(null);
+    setActiveSchedule(null);
+    setAlert(null);
+    setIsProcessing(false);
+  }, []);
+
+  const showAlertAndAutoReset = (nextAlert: NonNullable<AlertState>, autoResetMs = 3200) => {
+    setAlert(nextAlert);
+    setTimeout(() => {
+      setAlert(null);
+      if (nextAlert.type !== 'error') {
+        setStep(1);
+        setScannedStudent(null);
+        setAssignedLaptop(null);
+        setActiveSchedule(null);
+      }
+      setIsProcessing(false);
+    }, autoResetMs);
+  };
+
+  const handleScanCode = async (code: string) => {
+    const cleanCode = code.trim().toUpperCase();
+    if (!cleanCode || isProcessing) return;
+
+    setIsProcessing(true);
+    setAlert(null);
+
+    try {
+      // ==========================================
+      // LANGKAH 1: SCAN KODE UNIK KARTU SISWA (SIS-XXXX)
+      // ==========================================
+      if (step === 1) {
+        const { data: student, error } = await supabase
+          .from('students')
+          .select('*')
+          .eq('student_code', cleanCode)
+          .single();
+
+        if (error || !student) {
+          playFeedback('error');
+          showAlertAndAutoReset(
+            {
+              type: 'error',
+              title: 'SISWA TIDAK TERDAFTAR',
+              message: `Kode kartu "${cleanCode}" tidak ditemukan di sistem.`,
+            },
+            2800
+          );
+          return;
+        }
+
+        // Ambil jatah laptop dan jadwal aktif hari ini secara paralel
+        const today = new Date().getDay();
+        const [{ data: laptopJatah }, { data: todaySchedules }] = await Promise.all([
+          supabase
+            .from('laptops')
+            .select('*')
+            .eq('assigned_student_id', student.id)
+            .maybeSingle(),
+          supabase
+            .from('schedules')
+            .select('*')
+            .eq('day_of_week', today)
+            .eq('is_active', true),
+        ]);
+
+        const matchedSch = findMatchingSchedule((todaySchedules as Schedule[]) || [], student.class);
+
+        playFeedback('scan');
+        setScannedStudent(student);
+        setAssignedLaptop(laptopJatah || null);
+        setActiveSchedule(matchedSch);
+        setStep(2);
+        setIsProcessing(false);
+        return;
+      }
+
+      // ==========================================
+      // LANGKAH 2: SCAN TAS LAPTOP (VALIDASI PROFIL + JADWAL)
+      // ==========================================
+      if (step === 2 && scannedStudent) {
+        const { data: laptop, error: laptopErr } = await supabase
+          .from('laptops')
+          .select('*, students:assigned_student_id(name, class, student_code)')
+          .eq('asset_code', cleanCode)
+          .single();
+
+        if (laptopErr || !laptop) {
+          playFeedback('error');
+          showAlertAndAutoReset(
+            {
+              type: 'error',
+              title: 'LAPTOP TIDAK TERDAFTAR',
+              message: `Kode tas/laptop "${cleanCode}" tidak ditemukan.`,
+            },
+            3000
+          );
+          return;
+        }
+
+        // VALIDASI 1: KECOCOKAN PROFIL SISWA & TAS LAPTOP
+        if (laptop.assigned_student_id !== scannedStudent.id) {
+          playFeedback('error');
+          const ownerInfo = laptop.students
+            ? `${laptop.students.name} (${laptop.students.class})`
+            : 'Belum dialokasikan ke siswa manapun';
+
+          showAlertAndAutoReset(
+            {
+              type: 'error',
+              title: 'SALAH TAS LAPTOP!',
+              message: `${laptop.asset_code} terdaftar milik ${ownerInfo}, bukan milik ${scannedStudent.name}.`,
+            },
+            4000
+          );
+          return;
+        }
+
+        // JIKA STATUS AVAILABLE -> PROSES PENGAMBILAN (WAJIB CEK JADWAL!)
+        if (laptop.status === 'available') {
+          // VALIDASI 2: KESESUAIAN JADWAL PEMAKAIAN
+          if (!activeSchedule) {
+            playFeedback('error');
+            const todayName = DAYS_ID[new Date().getDay()];
+            showAlertAndAutoReset(
+              {
+                type: 'error',
+                title: 'TIDAK SESUAI JADWAL!',
+                message: `Hari ${todayName} jam ini bukan jadwal pemakaian laptop untuk kelas ${scannedStudent.class}. Pengambilan ditolak.`,
+              },
+              4200
+            );
+            return;
+          }
+
+          const { error: txErr } = await supabase.from('transactions').insert({
+            student_id: scannedStudent.id,
+            laptop_id: laptop.id,
+            purpose: activeSchedule.purpose,
+            status: 'active',
+          });
+          if (txErr) throw txErr;
+
+          const { error: updErr } = await supabase
+            .from('laptops')
+            .update({ status: 'borrowed' })
+            .eq('id', laptop.id);
+          if (updErr) throw updErr;
+
+          playFeedback('success');
+          showAlertAndAutoReset({
+            type: 'borrowed',
+            title: 'COCOK — BERHASIL DIAMBIL',
+            message: `${scannedStudent.name} mengambil ${laptop.asset_code} untuk ${activeSchedule.purpose}.`,
+          });
+          return;
+        }
+
+        // JIKA STATUS BORROWED -> PROSES PENGEMBALIAN (SELALU DIIZINKAN)
+        if (laptop.status === 'borrowed') {
+          const { data: activeTx } = await supabase
+            .from('transactions')
+            .select('id')
+            .eq('student_id', scannedStudent.id)
+            .eq('laptop_id', laptop.id)
+            .eq('status', 'active')
+            .order('borrow_time', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (activeTx) {
+            await supabase
+              .from('transactions')
+              .update({ return_time: new Date().toISOString(), status: 'returned' })
+              .eq('id', activeTx.id);
+          }
+
+          await supabase
+            .from('laptops')
+            .update({ status: 'available' })
+            .eq('id', laptop.id);
+
+          playFeedback('return');
+          showAlertAndAutoReset({
+            type: 'returned',
+            title: 'COCOK — BERHASIL DIKEMBALIKAN',
+            message: `${laptop.asset_code} telah dikembalikan oleh ${scannedStudent.name}.`,
+          });
+          return;
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      playFeedback('error');
+      showAlertAndAutoReset(
+        {
+          type: 'error',
+          title: 'TERJADI KESALAHAN',
+          message: 'Periksa koneksi internet Anda lalu coba scan ulang.',
+        },
+        3000
+      );
+    }
+  };
+
+  const handleManualSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!manualCode.trim()) return;
+    handleScanCode(manualCode);
+    setManualCode('');
+  };
+
+  return (
+    <div className="p-4">
+      <header className="mb-4 flex items-center justify-between">
+        <div>
+          <h1 className="text-lg font-bold text-slate-900">Scan Transaksi Laptop</h1>
+          <p className="text-xs text-slate-500">Validasi Profil Siswa, Tas Laptop &amp; Jadwal</p>
+        </div>
+        {step === 2 && (
+          <button
+            onClick={resetProcess}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-red-50 px-3 py-1.5 text-xs font-semibold text-red-600 active:scale-95"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            Reset
+          </button>
+        )}
+      </header>
+
+      {/* Indikator Langkah */}
+      <div className="mb-4 grid grid-cols-2 gap-2">
+        <div
+          className={`flex items-center gap-2 rounded-xl border p-2.5 text-xs font-semibold ${
+            step === 1
+              ? 'border-blue-500 bg-blue-50 text-blue-700'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+          }`}
+        >
+          <UserCheck className="h-4 w-4 shrink-0" />
+          <span>1. Scan Kartu Siswa</span>
+        </div>
+        <div
+          className={`flex items-center gap-2 rounded-xl border p-2.5 text-xs font-semibold ${
+            step === 2
+              ? 'border-blue-500 bg-blue-50 text-blue-700'
+              : 'border-slate-200 bg-white text-slate-400'
+          }`}
+        >
+          <LaptopIcon className="h-4 w-4 shrink-0" />
+          <span>2. Scan Tas Laptop</span>
+        </div>
+      </div>
+
+      {/* Kamera Pemindai */}
+      <div className="relative mb-4">
+        <QrScanner onScan={handleScanCode} paused={isProcessing || Boolean(alert)} />
+
+        {alert && (
+          <div
+            onClick={() => {
+              setAlert(null);
+              if (alert.type !== 'error') resetProcess();
+              else setIsProcessing(false);
+            }}
+            className={`absolute inset-0 z-20 flex cursor-pointer flex-col items-center justify-center rounded-2xl p-6 text-center text-white shadow-xl ${
+              alert.type === 'borrowed'
+                ? 'bg-emerald-600/95'
+                : alert.type === 'returned'
+                ? 'bg-blue-600/95'
+                : 'bg-red-600/95'
+            }`}
+          >
+            {alert.type === 'error' ? (
+              <XCircle className="mb-3 h-16 w-16" />
+            ) : (
+              <CheckCircle2 className="mb-3 h-16 w-16" />
+            )}
+            <h2 className="mb-1 text-xl font-extrabold">{alert.title}</h2>
+            <p className="text-sm text-white/90">{alert.message}</p>
+            <span className="mt-4 rounded-full bg-black/20 px-3 py-1 text-[11px]">
+              Ketuk untuk lanjut
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Kartu Profil Siswa + Status Jadwal */}
+      {step === 2 && scannedStudent && (
+        <div className="mb-4 space-y-2.5 rounded-2xl border border-blue-200 bg-white p-4 shadow-sm">
+          <div className="flex items-center gap-3.5">
+            <img
+              src={
+                scannedStudent.photo_url ||
+                `https://api.dicebear.com/9.x/initials/svg?seed=${encodeURIComponent(
+                  scannedStudent.name
+                )}`
+              }
+              alt={scannedStudent.name}
+              className="h-14 w-14 rounded-full border-2 border-blue-100 bg-slate-100 object-cover"
+            />
+            <div className="flex-1">
+              <span className="inline-block rounded-md bg-blue-50 px-2 py-0.5 font-mono text-[11px] font-bold text-blue-700">
+                {scannedStudent.student_code}
+              </span>
+              <h3 className="text-base font-bold text-slate-900">{scannedStudent.name}</h3>
+              <p className="text-xs text-slate-500">Kelas {scannedStudent.class}</p>
+            </div>
+          </div>
+
+          {/* Status Jadwal */}
+          {assignedLaptop?.status === 'borrowed' ? (
+            <div className="flex items-center gap-2 rounded-xl bg-blue-50 p-2.5 text-xs font-semibold text-blue-700">
+              <CalendarCheck className="h-4 w-4 shrink-0" />
+              <span>Mode Pengembalian: Scan tas {assignedLaptop.asset_code} untuk mengembalikan.</span>
+            </div>
+          ) : activeSchedule ? (
+            <div className="flex items-center gap-2 rounded-xl bg-emerald-50 p-2.5 text-xs font-semibold text-emerald-700">
+              <CalendarCheck className="h-4 w-4 shrink-0" />
+              <span>
+                Jadwal Valid: <strong>{activeSchedule.purpose}</strong> (
+                {activeSchedule.start_time.slice(0, 5)}–{activeSchedule.end_time.slice(0, 5)})
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 rounded-xl bg-red-50 p-2.5 text-xs font-semibold text-red-700">
+              <CalendarX className="h-4 w-4 shrink-0" />
+              <span>Di luar jadwal pemakaian kelas {scannedStudent.class} — Pengambilan diblokir!</span>
+            </div>
+          )}
+
+          {/* Info Tas Laptop Jatah */}
+          <div className="rounded-xl bg-slate-50 p-3">
+            {assignedLaptop ? (
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-[11px] font-medium text-slate-500">Tas Laptop Jatah:</p>
+                  <p className="font-mono text-sm font-bold text-slate-900">
+                    {assignedLaptop.asset_code}{' '}
+                    <span className="font-sans font-normal text-slate-600">
+                      — {assignedLaptop.brand_model}
+                    </span>
+                  </p>
+                </div>
+                <span
+                  className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${
+                    assignedLaptop.status === 'available'
+                      ? 'bg-emerald-100 text-emerald-700'
+                      : 'bg-amber-100 text-amber-700'
+                  }`}
+                >
+                  {assignedLaptop.status === 'available' ? 'Tersedia' : 'Dipinjam'}
+                </span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-xs font-medium text-red-600">
+                <ShieldAlert className="h-4 w-4 shrink-0" />
+                <span>Siswa belum memiliki jatah laptop di Data Master.</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Input Manual */}
+      <form onSubmit={handleManualSubmit} className="flex gap-2">
+        <div className="relative flex-1">
+          <Keyboard className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={manualCode}
+            onChange={(e) => setManualCode(e.target.value)}
+            placeholder={
+              step === 1
+                ? 'Ketik manual kode siswa (cth: SIS-0001)'
+                : 'Ketik manual kode tas (cth: LAP-001)'
+            }
+            className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-9 pr-3 text-sm uppercase outline-none focus:border-blue-500"
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={isProcessing}
+          className="rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white active:scale-95 disabled:opacity-50"
+        >
+          Kirim
+        </button>
+      </form>
+    </div>
+  );
+}
+
+```
+
+---
+
+## 4. Halaman Data Master: Auto-Kode, Upload CSV & Jadwal (`app/master/page.tsx`)
+
+Halaman ini kini memiliki 3 tab: **Siswa** (tambah satuan + *Upload Template CSV* dengan kode unik otomatis), **Laptop**, dan **Jadwal** (mengatur peruntukan Bimbel 10/11/12, SUGT, dan Kegiatan Lainnya).
+
+```tsx
+'use client';
+
+import { useEffect, useState, useCallback } from 'react';
+import {
+  Plus,
+  QrCode,
+  Users,
+  Laptop as LaptopIcon,
+  CalendarClock,
+  Upload,
+  Download,
+  Trash2,
+} from 'lucide-react';
+import {
+  supabase,
+  Student,
+  Laptop,
+  Schedule,
+  LAPTOP_PURPOSES,
+  LaptopPurpose,
+  DAYS_ID,
+} from '@/lib/supabase';
+import QrModal from '@/components/QrModal';
+
+export default function MasterPage() {
+  const [activeTab, setActiveTab] = useState<'students' | 'laptops' | 'schedules'>('students');
+  const [students, setStudents] = useState<Student[]>([]);
+  const [laptops, setLaptops] = useState<Laptop[]>([]);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Form Siswa (Tanpa NISN — kode otomatis dari database)
+  const [name, setName] = useState('');
+  const [studentClass, setStudentClass] = useState('');
+  const [photoUrl, setPhotoUrl] = useState('');
+
+  // Form Laptop
+  const [assetCode, setAssetCode] = useState('');
+  const [brandModel, setBrandModel] = useState('');
+  const [assignedStudentId, setAssignedStudentId] = useState('');
+
+  // Form Jadwal
+  const [purpose, setPurpose] = useState<LaptopPurpose>('Bimbel Kelas 10');
+  const [targetClass, setTargetClass] = useState('10');
+  const [dayOfWeek, setDayOfWeek] = useState(1);
+  const [startTime, setStartTime] = useState('15:30');
+  const [endTime, setEndTime] = useState('17:30');
+
+  const [submitting, setSubmitting] = useState(false);
+  const [formMsg, setFormMsg] = useState<string | null>(null);
+  const [qrTarget, setQrTarget] = useState<{
+    title: string;
+    subtitle: string;
+    value: string;
+  } | null>(null);
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    const [{ data: sData }, { data: lData }, { data: schData }] = await Promise.all([
+      supabase.from('students').select('*').order('student_code'),
+      supabase
+        .from('laptops')
+        .select('*, students:assigned_student_id(id, name, class, student_code)')
+        .order('asset_code'),
+      supabase.from('schedules').select('*').order('day_of_week').order('start_time'),
+    ]);
+    setStudents(sData || []);
+    setLaptops((lData as Laptop[]) || []);
+    setSchedules((schData as Schedule[]) || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  // Tambah Siswa Satuan (student_code dibuat otomatis oleh PostgreSQL)
+  const handleAddStudent = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setFormMsg(null);
+
+    const { data, error } = await supabase
+      .from('students')
+      .insert({
+        name: name.trim(),
+        class: studentClass.trim(),
+        photo_url: photoUrl.trim() || null,
+      })
+      .select('student_code')
+      .single();
+
+    if (error) {
+      setFormMsg(`Gagal: ${error.message}`);
+    } else {
+      setName('');
+      setStudentClass('');
+      setPhotoUrl('');
+      setFormMsg(`Berhasil! Kode unik otomatis: ${data.student_code}`);
+      await fetchAll();
+    }
+    setSubmitting(false);
+  };
+
+  // Unduh Template CSV Siswa
+  const handleDownloadTemplate = () => {
+    const csvContent = 'nama,kelas,photo_url\nRina Putri,10 IPA 2,\nFajar Pratama,11 IPS 1,\n';
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'template-upload-siswa.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Upload Template CSV Siswa (Kode unik otomatis terisi untuk semua baris)
+  const handleCsvUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setSubmitting(true);
+    setFormMsg(null);
+
+    try {
+      const text = await file.text();
+      const lines = text
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      // Lewati baris header (nama,kelas,photo_url)
+      const rows = lines.slice(1).map((line) => {
+        const [nama, kelas, foto] = line.split(',').map((v) => v?.trim() || '');
+        return {
+          name: nama,
+          class: kelas,
+          photo_url: foto || null,
+        };
+      }).filter((r) => r.name && r.class);
+
+      if (rows.length === 0) {
+        setFormMsg('File CSV kosong atau format kolom tidak sesuai.');
+        setSubmitting(false);
+        return;
+      }
+
+      const { error } = await supabase.from('students').insert(rows);
+      if (error) {
+        setFormMsg(`Gagal upload: ${error.message}`);
+      } else {
+        setFormMsg(`${rows.length} siswa berhasil di-upload dengan kode unik otomatis!`);
+        await fetchAll();
+      }
+    } catch {
+      setFormMsg('Gagal membaca file CSV.');
+    } finally {
+      e.target.value = '';
+      setSubmitting(false);
+    }
+  };
+
+  // Tambah Laptop
+  const handleAddLaptop = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setFormMsg(null);
+
+    const { error } = await supabase.from('laptops').insert({
+      asset_code: assetCode.trim().toUpperCase(),
+      brand_model: brandModel.trim(),
+      status: 'available',
+      assigned_student_id: assignedStudentId || null,
+    });
+
+    if (error) {
+      setFormMsg(`Gagal: ${error.message}`);
+    } else {
+      setAssetCode('');
+      setBrandModel('');
+      setAssignedStudentId('');
+      setFormMsg('Laptop berhasil ditambahkan.');
+      await fetchAll();
+    }
+    setSubmitting(false);
+  };
+
+  // Tambah Jadwal Pemakaian
+  const handleAddSchedule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setFormMsg(null);
+
+    const { error } = await supabase.from('schedules').insert({
+      purpose,
+      target_class: targetClass.trim().toUpperCase(),
+      day_of_week: Number(dayOfWeek),
+      start_time: `${startTime}:00`,
+      end_time: `${endTime}:00`,
+      is_active: true,
+    });
+
+    if (error) {
+      setFormMsg(`Gagal: ${error.message}`);
+    } else {
+      setFormMsg('Jadwal pemakaian berhasil ditambahkan.');
+      await fetchAll();
+    }
+    setSubmitting(false);
+  };
+
+  const handleDeleteSchedule = async (id: string) => {
+    await supabase.from('schedules').delete().eq('id', id);
+    await fetchAll();
+  };
+
+  const assignedIds = new Set(laptops.map((l) => l.assigned_student_id).filter(Boolean));
+  const unassignedStudents = students.filter((s) => !assignedIds.has(s.id));
+
+  return (
+    <div className="p-4">
+      <header className="mb-4">
+        <h1 className="text-lg font-bold text-slate-900">Data Master &amp; Jadwal</h1>
+        <p className="text-xs text-slate-500">
+          Kelola siswa (kode otomatis), laptop, dan jadwal peruntukan
+        </p>
+      </header>
+
+      {/* 3 Tab Navigasi */}
+      <div className="mb-4 grid grid-cols-3 rounded-xl bg-slate-200/70 p-1">
+        <button
+          onClick={() => {
+            setActiveTab('students');
+            setFormMsg(null);
+          }}
+          className={`flex items-center justify-center gap-1 rounded-lg py-2 text-xs font-semibold transition ${
+            activeTab === 'students' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600'
+          }`}
+        >
+          <Users className="h-3.5 w-3.5" />
+          Siswa
+        </button>
+        <button
+          onClick={() => {
+            setActiveTab('laptops');
+            setFormMsg(null);
+          }}
+          className={`flex items-center justify-center gap-1 rounded-lg py-2 text-xs font-semibold transition ${
+            activeTab === 'laptops' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600'
+          }`}
+        >
+          <LaptopIcon className="h-3.5 w-3.5" />
+          Laptop
+        </button>
+        <button
+          onClick={() => {
+            setActiveTab('schedules');
+            setFormMsg(null);
+          }}
+          className={`flex items-center justify-center gap-1 rounded-lg py-2 text-xs font-semibold transition ${
+            activeTab === 'schedules' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600'
+          }`}
+        >
+          <CalendarClock className="h-3.5 w-3.5" />
+          Jadwal
+        </button>
+      </div>
+
+      {/* TAB 1: SISWA (INPUT SATUAN + UPLOAD CSV) */}
+      {activeTab === 'students' && (
+        <>
+          <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h2 className="mb-2 text-sm font-bold text-slate-800">Upload Massal (Template CSV)</h2>
+            <p className="mb-3 text-[11px] text-slate-500">
+              Kode unik siswa (SIS-XXXX) dibuat otomatis saat file CSV di-upload.
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={handleDownloadTemplate}
+                className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 py-2 text-xs font-semibold text-slate-700 active:scale-95"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Unduh Template
+              </button>
+              <label className="flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-emerald-600 py-2 text-xs font-semibold text-white active:scale-95">
+                <Upload className="h-3.5 w-3.5" />
+                Upload CSV
+                <input
+                  type="file"
+                  accept=".csv"
+                  onChange={handleCsvUpload}
+                  className="hidden"
+                  disabled={submitting}
+                />
+              </label>
+            </div>
+          </div>
+
+          <form
+            onSubmit={handleAddStudent}
+            className="mb-5 space-y-2.5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+          >
+            <h2 className="text-sm font-bold text-slate-800">Tambah Siswa Satuan</h2>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                required
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Nama Lengkap"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              />
+              <input
+                required
+                type="text"
+                value={studentClass}
+                onChange={(e) => setStudentClass(e.target.value)}
+                placeholder="Kelas (cth: 10 IPA 1)"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              />
+            </div>
+            <input
+              type="url"
+              value={photoUrl}
+              onChange={(e) => setPhotoUrl(e.target.value)}
+              placeholder="URL Foto (opsional)"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+            />
+            <button
+              type="submit"
+              disabled={submitting}
+              className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-blue-600 py-2.5 text-sm font-semibold text-white active:scale-95 disabled:opacity-50"
+            >
+              <Plus className="h-4 w-4" />
+              Simpan (Kode Unik Otomatis)
+            </button>
+            {formMsg && <p className="text-xs font-medium text-blue-600">{formMsg}</p>}
+          </form>
+
+          <div className="space-y-2.5">
+            {students.map((s) => {
+              const ownedLaptop = laptops.find((l) => l.assigned_student_id === s.id);
+              return (
+                <div
+                  key={s.id}
+                  className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm"
+                >
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900">{s.name}</h3>
+                    <p className="text-xs text-slate-500">
+                      Kode: <span className="font-mono font-bold text-slate-700">{s.student_code}</span>{' '}
+                      &bull; Kelas {s.class}
+                    </p>
+                    <p className="mt-0.5 text-[11px] font-medium text-blue-600">
+                      {ownedLaptop ? `Jatah: ${ownedLaptop.asset_code}` : 'Belum ada jatah laptop'}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() =>
+                      setQrTarget({
+                        title: s.name,
+                        subtitle: `Kartu Siswa — Kelas ${s.class}`,
+                        value: s.student_code,
+                      })
+                    }
+                    className="flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 active:scale-95"
+                  >
+                    <QrCode className="h-4 w-4" />
+                    QR
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {/* TAB 2: LAPTOP */}
+      {activeTab === 'laptops' && (
+        <>
+          <form
+            onSubmit={handleAddLaptop}
+            className="mb-5 space-y-2.5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+          >
+            <h2 className="text-sm font-bold text-slate-800">Tambah Laptop &amp; Hubungkan Siswa</h2>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                required
+                type="text"
+                value={assetCode}
+                onChange={(e) => setAssetCode(e.target.value)}
+                placeholder="Kode (cth: LAP-004)"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm uppercase outline-none focus:border-blue-500"
+              />
+              <input
+                required
+                type="text"
+                value={brandModel}
+                onChange={(e) => setBrandModel(e.target.value)}
+                placeholder="Merk / Tipe"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              />
+            </div>
+            <select
+              value={assignedStudentId}
+              onChange={(e) => setAssignedStudentId(e.target.value)}
+              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
+            >
+              <option value="">-- Pilih Pemilik Siswa --</option>
+              {unassignedStudents.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.student_code} — {s.name} ({s.class})
+                </option>
+              ))}
+            </select>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-blue-600 py-2.5 text-sm font-semibold text-white active:scale-95 disabled:opacity-50"
+            >
+              <Plus className="h-4 w-4" />
+              Simpan Laptop
+            </button>
+            {formMsg && <p className="text-xs font-medium text-blue-600">{formMsg}</p>}
+          </form>
+
+          <div className="space-y-2.5">
+            {laptops.map((l) => (
+              <div
+                key={l.id}
+                className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm"
+              >
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-sm font-bold text-slate-900">
+                      {l.asset_code}
+                    </span>
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                        l.status === 'available'
+                          ? 'bg-emerald-100 text-emerald-700'
+                          : 'bg-amber-100 text-amber-700'
+                      }`}
+                    >
+                      {l.status === 'available' ? 'Tersedia' : 'Dipinjam'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500">{l.brand_model}</p>
+                  <p className="mt-0.5 text-[11px] font-medium text-slate-700">
+                    Pemilik:{' '}
+                    {l.students
+                      ? `${l.students.name} (${l.students.student_code})`
+                      : 'Belum ditentukan'}
+                  </p>
+                </div>
+                <button
+                  onClick={() =>
+                    setQrTarget({
+                      title: l.asset_code,
+                      subtitle: `Stiker Tas Laptop — ${l.brand_model}`,
+                      value: l.asset_code,
+                    })
+                  }
+                  className="flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 active:scale-95"
+                >
+                  <QrCode className="h-4 w-4" />
+                  QR
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* TAB 3: JADWAL & PERUNTUKAN */}
+      {activeTab === 'schedules' && (
+        <>
+          <form
+            onSubmit={handleAddSchedule}
+            className="mb-5 space-y-2.5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+          >
+            <h2 className="text-sm font-bold text-slate-800">Tambah Jadwal Pemakaian</h2>
+            <select
+              value={purpose}
+              onChange={(e) => {
+                const val = e.target.value as LaptopPurpose;
+                setPurpose(val);
+                if (val === 'Bimbel Kelas 10') setTargetClass('10');
+                else if (val === 'Bimbel Kelas 11') setTargetClass('11');
+                else if (val === 'Bimbel Kelas 12') setTargetClass('12');
+                else setTargetClass('SEMUA');
+              }}
+              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
+            >
+              {LAPTOP_PURPOSES.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+
+            <div className="grid grid-cols-2 gap-2">
+              <select
+                value={dayOfWeek}
+                onChange={(e) => setDayOfWeek(Number(e.target.value))}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
+              >
+                {DAYS_ID.map((day, idx) => (
+                  <option key={day} value={idx}>
+                    {day}
+                  </option>
+                ))}
+              </select>
+              <input
+                required
+                type="text"
+                value={targetClass}
+                onChange={(e) => setTargetClass(e.target.value)}
+                placeholder="Target Kelas (10 / 11 / 12 / SEMUA)"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm uppercase outline-none focus:border-blue-500"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="mb-1 block text-[11px] text-slate-500">Jam Mulai</label>
+                <input
+                  required
+                  type="time"
+                  value={startTime}
+                  onChange={(e) => setStartTime(e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[11px] text-slate-500">Jam Selesai</label>
+                <input
+                  required
+                  type="time"
+                  value={endTime}
+                  onChange={(e) => setEndTime(e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={submitting}
+              className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-blue-600 py-2.5 text-sm font-semibold text-white active:scale-95 disabled:opacity-50"
+            >
+              <Plus className="h-4 w-4" />
+              Simpan Jadwal
+            </button>
+            {formMsg && <p className="text-xs font-medium text-blue-600">{formMsg}</p>}
+          </form>
+
+          <div className="space-y-2.5">
+            {schedules.map((sch) => (
+              <div
+                key={sch.id}
+                className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm"
+              >
+                <div>
+                  <span className="inline-block rounded-md bg-blue-50 px-2 py-0.5 text-[11px] font-bold text-blue-700">
+                    {sch.purpose}
+                  </span>
+                  <p className="mt-1 text-sm font-bold text-slate-900">
+                    {DAYS_ID[sch.day_of_week]}, {sch.start_time.slice(0, 5)} –{' '}
+                    {sch.end_time.slice(0, 5)}
+                  </p>
+                  <p className="text-xs text-slate-500">Target Kelas: {sch.target_class}</p>
+                </div>
+                <button
+                  onClick={() => handleDeleteSchedule(sch.id)}
+                  className="rounded-xl bg-red-50 p-2 text-red-600 active:scale-95"
+                  title="Hapus jadwal"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {qrTarget && (
+        <QrModal
+          title={qrTarget.title}
+          subtitle={qrTarget.subtitle}
+          value={qrTarget.value}
+          onClose={() => setQrTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+```
+
+---
+
+### Catatan Kecil untuk `app/monitoring/page.tsx`
+
+Karena `nisn` sudah diganti menjadi `student_code`, cukup ubah 2 baris di `app/monitoring/page.tsx`:
+
+* `tx.students?.nisn` → ganti menjadi `tx.students?.student_code`
+* Tambahkan tampilan badge `{tx.purpose}` di kartu transaksi agar petugas langsung melihat apakah siswa tersebut mengambil laptop untuk **Bimbel Kelas 10/11/12**, **SUGT**, atau **Kegiatan Lainnya**.

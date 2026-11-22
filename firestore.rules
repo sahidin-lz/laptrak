@@ -1,0 +1,216 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'sahidin30@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // 3. Entity Validation Blueprints (Anti-Update-Gap)
+    function isValidKioskBundle(data, bundleId) {
+      return data.keys().hasAll([
+          'bundleId',
+          'ownerId',
+          'schoolName',
+          'payloadJson',
+          'version',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'bundleId',
+          'ownerId',
+          'schoolName',
+          'payloadJson',
+          'version',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.bundleId is string &&
+        data.bundleId.size() >= 1 &&
+        data.bundleId.size() <= 64 &&
+        data.bundleId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.bundleId == bundleId &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.schoolName is string &&
+        data.schoolName.size() >= 1 &&
+        data.schoolName.size() <= 120 &&
+        data.payloadJson is string &&
+        data.payloadJson.size() >= 2 &&
+        data.payloadJson.size() <= 900000 &&
+        data.version is int &&
+        data.version >= 1 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTransactionAudit(data, txId) {
+      return data.keys().hasAll([
+          'txId',
+          'ownerId',
+          'studentCode',
+          'studentName',
+          'assetCode',
+          'transactionType',
+          'status',
+          'purpose',
+          'piketName',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'txId',
+          'ownerId',
+          'studentCode',
+          'studentName',
+          'assetCode',
+          'transactionType',
+          'status',
+          'purpose',
+          'piketName',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.txId is string &&
+        data.txId.size() >= 1 &&
+        data.txId.size() <= 64 &&
+        data.txId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.txId == txId &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.studentCode is string &&
+        data.studentCode.size() >= 1 &&
+        data.studentCode.size() <= 40 &&
+        data.studentName is string &&
+        data.studentName.size() >= 1 &&
+        data.studentName.size() <= 120 &&
+        data.assetCode is string &&
+        data.assetCode.size() >= 1 &&
+        data.assetCode.size() <= 40 &&
+        data.transactionType is string &&
+        data.transactionType.size() <= 20 &&
+        (data.transactionType == 'harian' || data.transactionType == 'pulang') &&
+        data.status is string &&
+        data.status.size() <= 20 &&
+        (data.status == 'active' || data.status == 'returned') &&
+        data.purpose is string &&
+        data.purpose.size() >= 1 &&
+        data.purpose.size() <= 160 &&
+        data.piketName is string &&
+        data.piketName.size() >= 1 &&
+        data.piketName.size() <= 100 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // 4. Collection: /kiosk_bundles/{bundleId}
+    match /kiosk_bundles/{bundleId} {
+      allow get: if isSignedIn() && isValidId(bundleId) && (
+        existing().ownerId == request.auth.uid || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        existing().ownerId == request.auth.uid || request.auth.token.email == 'sahidin30@gmail.com'
+      );
+      allow create: if isSignedIn() &&
+        isValidId(bundleId) &&
+        isValidKioskBundle(incoming(), bundleId) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isSignedIn() &&
+        isValidId(bundleId) &&
+        isValidKioskBundle(incoming(), bundleId) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'schoolName',
+              'payloadJson',
+              'version',
+              'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(bundleId) && (
+        existing().ownerId == request.auth.uid || isAdmin()
+      );
+    }
+
+    // 5. Collection: /transaction_audits/{txId}
+    match /transaction_audits/{txId} {
+      allow get: if isSignedIn() && isValidId(txId) && (
+        existing().ownerId == request.auth.uid || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        existing().ownerId == request.auth.uid || request.auth.token.email == 'sahidin30@gmail.com'
+      );
+      allow create: if isSignedIn() &&
+        isValidId(txId) &&
+        isValidTransactionAudit(incoming(), txId) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isSignedIn() &&
+        isValidId(txId) &&
+        isValidTransactionAudit(incoming(), txId) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            existing().ownerId == request.auth.uid &&
+            existing().status != 'returned' &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'purpose',
+              'piketName',
+              'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(txId) && isAdmin();
+    }
+
+    // 6. Collection: /admins/{adminUid}
+    match /admins/{adminUid} {
+      allow get: if isSignedIn() && isValidId(adminUid) && (
+        request.auth.uid == adminUid || isAdmin()
+      );
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+  }
+}
