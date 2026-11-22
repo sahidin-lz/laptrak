@@ -1,3 +1,4 @@
+import * as XLSX from 'xlsx';
 import {
   DailySessionConfig,
   DailySessionKey,
@@ -228,13 +229,149 @@ export interface ParsedStaffRow {
 
 export type ParsedStaffCsvRow = ParsedStaffRow;
 
+/**
+ * Download a native multi-column Excel (.xlsx) file so each field is in its own
+ * separate column (Kolom A, Kolom B, Kolom C, ...) when opened in Microsoft Excel,
+ * WPS Office, LibreOffice, or Google Sheets.
+ */
+export function downloadMultiColumnExcel(
+  filename: string,
+  sheetName: string,
+  headers: string[],
+  rows: string[][],
+  colWidths?: number[]
+): void {
+  const aoa: string[][] = [headers, ...rows];
+  const worksheet = XLSX.utils.aoa_to_sheet(aoa);
+
+  worksheet['!cols'] = headers.map((h, idx) => {
+    if (colWidths && colWidths[idx]) {
+      return { wch: colWidths[idx] };
+    }
+    const maxCellLen = rows.reduce((max, r) => Math.max(max, (r[idx] || '').length), h.length);
+    return { wch: Math.max(18, maxCellLen + 5) };
+  });
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, sheetName.slice(0, 31));
+
+  const cleanFilename = filename.endsWith('.xlsx')
+    ? filename
+    : `${filename.replace(/\.(csv|xls)$/i, '')}.xlsx`;
+  XLSX.writeFile(workbook, cleanFilename);
+}
+
+/**
+ * Download an Excel-friendly CSV file with UTF-8 BOM and `sep=;` declaration
+ * so Microsoft Excel in Indonesian/European regional settings opens each column separately.
+ */
+export function downloadMultiColumnCsv(
+  filename: string,
+  headers: string[],
+  rows: string[][]
+): void {
+  const escapeCell = (val: string) => {
+    const cleaned = String(val ?? '').replace(/"/g, '""');
+    return /[;"\r\n]/.test(cleaned) ? `"${cleaned}"` : cleaned;
+  };
+  const lines = [
+    'sep=;',
+    headers.map(escapeCell).join(';'),
+    ...rows.map((r) => r.map(escapeCell).join(';')),
+  ];
+  const csvContent = `\uFEFF${lines.join('\r\n')}\r\n`;
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename.endsWith('.csv') ? filename : `${filename}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Read either an Excel (.xlsx / .xls) file or a CSV (.csv) file and convert it
+ * into normalized text lines where columns are separated by tabs ('\t').
+ */
+export async function readSpreadsheetFileToText(file: File): Promise<string> {
+  const lowerName = file.name.toLowerCase();
+  if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    const firstSheetName = workbook.SheetNames[0];
+    if (!firstSheetName) return '';
+    const sheet = workbook.Sheets[firstSheetName];
+    const aoa = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
+      header: 1,
+      defval: '',
+      raw: false,
+    });
+    return aoa
+      .map((row: unknown[]) =>
+        (Array.isArray(row) ? row : [])
+          .map((cell: unknown) =>
+            String(cell ?? '')
+              .replace(/[\r\n\t]+/g, ' ')
+              .trim()
+          )
+          .join('\t')
+      )
+      .filter((line: string) => line.replace(/\t/g, '').trim().length > 0)
+      .join('\n');
+  }
+
+  return await file.text();
+}
+
 function splitCsvLine(line: string): string[] {
-  const delimiter = line.includes('\t')
-    ? '\t'
-    : line.includes(';') && !line.includes(',')
-    ? ';'
-    : ',';
-  return line.split(delimiter).map((v) => v?.replace(/^"|"$/g, '').trim() || '');
+  if (line.includes('\t')) {
+    return line.split('\t').map((v) => v?.replace(/^"|"$/g, '').trim() || '');
+  }
+
+  // Count semicolons vs commas outside quotes
+  let semiCount = 0;
+  let commaCount = 0;
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (!inQuotes) {
+      if (ch === ';') semiCount++;
+      else if (ch === ',') commaCount++;
+    }
+  }
+  const delimiter = semiCount >= commaCount && semiCount > 0 ? ';' : ',';
+
+  const result: string[] = [];
+  let current = '';
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (quoted && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (ch === delimiter && !quoted) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result.map((v) => v.replace(/^"|"$/g, '').trim());
+}
+
+function normalizeCsvLines(text: string): string[] {
+  return text
+    .replace(/^\uFEFF/, '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => Boolean(line) && !/^sep=.$/i.test(line));
 }
 
 function parseWilayahCol(raw: string | undefined): Wilayah {
@@ -252,19 +389,15 @@ function parseStaffWilayahCol(raw: string | undefined): StaffWilayah {
 
 /**
  * Parse Student + Laptop CSV/Excel template:
- * Kolom: nama,kelas,wilayah,kode_laptop,merk_laptop,photo_url
+ * Kolom: nama | kelas | wilayah | kode_laptop | merk_laptop | photo_url
  */
 export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
+  const lines = normalizeCsvLines(text);
   if (lines.length <= 1) return [];
 
   const headerLine = lines[0].toLowerCase();
   const hasWilayah = headerLine.includes('wilayah');
-  const hasLaptop = headerLine.includes('kode_laptop');
+  const hasLaptop = headerLine.includes('kode_laptop') || headerLine.includes('kode laptop');
 
   return lines
     .slice(1)
@@ -308,14 +441,10 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
 
 /**
  * Parse Laptop-only CSV/Excel template:
- * Kolom: kode_laptop,merk_laptop,kode_siswa
+ * Kolom: kode_laptop | merk_laptop | kode_siswa
  */
 export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
+  const lines = normalizeCsvLines(text);
   if (lines.length <= 1) return [];
 
   return lines
@@ -333,14 +462,10 @@ export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
 
 /**
  * Parse Staff / Guru Piket CSV/Excel template:
- * Kolom: nama,username,token_barcode,wilayah,role,password
+ * Kolom: nama | username | token_barcode | wilayah | role | password
  */
 export function parseStaffCsv(text: string): ParsedStaffRow[] {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
+  const lines = normalizeCsvLines(text);
   if (lines.length <= 1) return [];
 
   return lines

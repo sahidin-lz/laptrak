@@ -45,6 +45,8 @@ import {
   WILAYAH_LABELS,
 } from '../types/models';
 import {
+  downloadMultiColumnCsv,
+  downloadMultiColumnExcel,
   formatDateTimeID,
   getSuggestedTargetClass,
   isStudentCurrentlySuspended,
@@ -54,6 +56,7 @@ import {
   parseLaptopCsv,
   parseStaffCsv,
   parseStudentCsv,
+  readSpreadsheetFileToText,
 } from '../lib/store';
 import { exportBagTagsPdf, exportStudentCardsPdf } from '../lib/pdfGenerator';
 import { SUPABASE_SQL_SCHEMA } from '../lib/supabaseSql';
@@ -392,16 +395,36 @@ export function MasterView({
     setSubmitting(false);
   };
 
+  const studentTemplateHeaders = [
+    'nama',
+    'kelas',
+    'wilayah',
+    'kode_laptop',
+    'merk_laptop',
+    'photo_url',
+  ];
+  const studentTemplateRows = [
+    ['Rina Putri', '10 IPA 2', 'putri', 'LAP-007', 'Lenovo IdeaPad Slim 3', ''],
+    ['Fajar Pratama', '11 IPS 1', 'putra', 'LAP-008', 'Asus Vivobook 14', ''],
+    ['Zahra Aulia', '12 IPA 2', 'putri', 'LAP-009', 'HP ProBook 440 G8', ''],
+  ];
+
+  const handleDownloadStudentExcelTemplate = () => {
+    downloadMultiColumnExcel(
+      'template-excel-siswa-dan-laptop.xlsx',
+      'Template Siswa & Laptop',
+      studentTemplateHeaders,
+      studentTemplateRows,
+      [24, 14, 12, 16, 26, 30]
+    );
+  };
+
   const handleDownloadStudentCsvTemplate = () => {
-    const csvContent =
-      'nama,kelas,wilayah,kode_laptop,merk_laptop,photo_url\nRina Putri,10 IPA 2,putri,LAP-007,Lenovo IdeaPad Slim 3,\nFajar Pratama,11 IPS 1,putra,LAP-008,Asus Vivobook 14,\nZahra Aulia,12 IPA 2,putri,LAP-009,HP ProBook 440 G8,\n';
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'template-csv-siswa-dan-laptop.csv';
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadMultiColumnCsv(
+      'template-csv-siswa-dan-laptop.csv',
+      studentTemplateHeaders,
+      studentTemplateRows
+    );
   };
 
   const handleStudentCsvUpload = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -410,26 +433,26 @@ export function MasterView({
     setSubmitting(true);
     setFormMsg(null);
     try {
-      const text = await file.text();
+      const text = await readSpreadsheetFileToText(file);
       const rows = parseStudentCsv(text);
       if (rows.length === 0) {
         setFormMsg({
           type: 'err',
-          text: 'File CSV kosong atau format header tidak sesuai (nama,kelas,wilayah,kode_laptop,merk_laptop,photo_url).',
+          text: 'File Excel/CSV kosong atau format kolom tidak sesuai (nama | kelas | wilayah | kode_laptop | merk_laptop | photo_url).',
         });
       } else {
         const res = await onBulkAddStudents(rows);
         if (res.ok) {
           setFormMsg({
             type: 'ok',
-            text: `${res.createdStudents} siswa (kode SIS-XXXX otomatis) dan ${res.createdLaptops} unit laptop berhasil diimpor dari CSV.`,
+            text: `${res.createdStudents} siswa (kode SIS-XXXX otomatis) dan ${res.createdLaptops} unit laptop berhasil diimpor dari template Excel/CSV.`,
           });
         } else {
-          setFormMsg({ type: 'err', text: res.error || 'Gagal impor CSV siswa.' });
+          setFormMsg({ type: 'err', text: res.error || 'Gagal impor data siswa.' });
         }
       }
     } catch {
-      setFormMsg({ type: 'err', text: 'Gagal membaca file CSV siswa.' });
+      setFormMsg({ type: 'err', text: 'Gagal membaca file Excel/CSV siswa.' });
     } finally {
       e.target.value = '';
       setSubmitting(false);
@@ -437,7 +460,7 @@ export function MasterView({
   };
 
   // ============================================================================
-  // LAPTOP CRUD & CSV TEMPLATE HANDLERS
+  // LAPTOP CRUD & EXCEL/CSV TEMPLATE HANDLERS
   // ============================================================================
   const startEditLaptop = (lp: Laptop) => {
     setEditingLaptopId(lp.id);
@@ -490,16 +513,29 @@ export function MasterView({
     setSubmitting(false);
   };
 
+  const laptopTemplateHeaders = ['kode_laptop', 'merk_laptop', 'kode_siswa'];
+  const laptopTemplateRows = [
+    ['LAP-007', 'Lenovo ThinkPad T480', 'SIS-0001'],
+    ['LAP-008', 'Asus Vivobook 14', 'SIS-0002'],
+    ['LAP-009', 'Acer TravelMate P2', ''],
+  ];
+
+  const handleDownloadLaptopExcelTemplate = () => {
+    downloadMultiColumnExcel(
+      'template-excel-unit-laptop.xlsx',
+      'Template Unit Laptop',
+      laptopTemplateHeaders,
+      laptopTemplateRows,
+      [18, 28, 18]
+    );
+  };
+
   const handleDownloadLaptopCsvTemplate = () => {
-    const csvContent =
-      'kode_laptop,merk_laptop,kode_siswa\nLAP-007,Lenovo ThinkPad T480,SIS-0001\nLAP-008,Asus Vivobook 14,SIS-0002\nLAP-009,Acer TravelMate P2,\n';
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'template-csv-unit-laptop.csv';
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadMultiColumnCsv(
+      'template-csv-unit-laptop.csv',
+      laptopTemplateHeaders,
+      laptopTemplateRows
+    );
   };
 
   const handleLaptopCsvUpload = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -508,26 +544,26 @@ export function MasterView({
     setSubmitting(true);
     setFormMsg(null);
     try {
-      const text = await file.text();
+      const text = await readSpreadsheetFileToText(file);
       const rows = parseLaptopCsv(text);
       if (rows.length === 0) {
         setFormMsg({
           type: 'err',
-          text: 'File CSV laptop kosong atau format header tidak sesuai (kode_laptop,merk_laptop,kode_siswa).',
+          text: 'File Excel/CSV laptop kosong atau format kolom tidak sesuai (kode_laptop | merk_laptop | kode_siswa).',
         });
       } else {
         const res = await onBulkAddLaptops(rows);
         if (res.ok) {
           setFormMsg({
             type: 'ok',
-            text: `Berhasil mengimpor CSV Laptop: ${res.createdLaptops} unit baru ditambahkan, ${res.updatedLaptops} unit diperbarui.`,
+            text: `Berhasil mengimpor Template Laptop: ${res.createdLaptops} unit baru ditambahkan, ${res.updatedLaptops} unit diperbarui.`,
           });
         } else {
-          setFormMsg({ type: 'err', text: res.error || 'Gagal impor CSV laptop.' });
+          setFormMsg({ type: 'err', text: res.error || 'Gagal impor file laptop.' });
         }
       }
     } catch {
-      setFormMsg({ type: 'err', text: 'Gagal membaca file CSV laptop.' });
+      setFormMsg({ type: 'err', text: 'Gagal membaca file Excel/CSV laptop.' });
     } finally {
       e.target.value = '';
       setSubmitting(false);
@@ -535,7 +571,7 @@ export function MasterView({
   };
 
   // ============================================================================
-  // STAFF / PEGAWAI & TOKEN BARCODE CRUD + CSV TEMPLATE HANDLERS
+  // STAFF / PEGAWAI & TOKEN BARCODE CRUD + EXCEL/CSV TEMPLATE HANDLERS
   // ============================================================================
   const startEditStaff = (stf: StaffMember) => {
     setEditingStaffId(stf.id);
@@ -603,16 +639,35 @@ export function MasterView({
     setSubmitting(false);
   };
 
+  const staffTemplateHeaders = [
+    'nama',
+    'username',
+    'token_barcode',
+    'wilayah',
+    'role',
+    'password',
+  ];
+  const staffTemplateRows = [
+    ['Ustadz Fauzan Hakim', 'piket.fauzan', 'PKT-205', 'putra', 'piket', 'Piket@Sekolah26'],
+    ['Ustadzah Nisa Rahma', 'piket.nisa', 'PKT-206', 'putri', 'piket', 'Piket@Sekolah26'],
+  ];
+
+  const handleDownloadStaffExcelTemplate = () => {
+    downloadMultiColumnExcel(
+      'template-excel-pegawai-token-barcode-guru.xlsx',
+      'Template Pegawai & Token',
+      staffTemplateHeaders,
+      staffTemplateRows,
+      [26, 18, 18, 14, 14, 20]
+    );
+  };
+
   const handleDownloadStaffCsvTemplate = () => {
-    const csvContent =
-      'nama,username,token_barcode,wilayah,role,password\nUstadz Fauzan Hakim,piket.fauzan,PKT-205,putra,piket,Piket@Sekolah26\nUstadzah Nisa Rahma,piket.nisa,PKT-206,putri,piket,Piket@Sekolah26\n';
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'template-csv-pegawai-token-barcode-guru.csv';
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadMultiColumnCsv(
+      'template-csv-pegawai-token-barcode-guru.csv',
+      staffTemplateHeaders,
+      staffTemplateRows
+    );
   };
 
   const handleStaffCsvUpload = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -621,26 +676,26 @@ export function MasterView({
     setSubmitting(true);
     setFormMsg(null);
     try {
-      const text = await file.text();
+      const text = await readSpreadsheetFileToText(file);
       const rows = parseStaffCsv(text);
       if (rows.length === 0) {
         setFormMsg({
           type: 'err',
-          text: 'File CSV pegawai kosong atau format header tidak sesuai (nama,username,token_barcode,wilayah,role,password).',
+          text: 'File Excel/CSV pegawai kosong atau format kolom tidak sesuai (nama | username | token_barcode | wilayah | role | password).',
         });
       } else {
         const res = await onBulkAddStaff(rows);
         if (res.ok) {
           setFormMsg({
             type: 'ok',
-            text: `Berhasil mengimpor CSV Pegawai: ${res.createdStaff} pegawai baru ditambahkan, ${res.updatedStaff} pegawai diperbarui beserta Token Barcode Login.`,
+            text: `Berhasil mengimpor Template Pegawai: ${res.createdStaff} pegawai baru ditambahkan, ${res.updatedStaff} pegawai diperbarui beserta Token Barcode Login.`,
           });
         } else {
-          setFormMsg({ type: 'err', text: res.error || 'Gagal impor CSV pegawai.' });
+          setFormMsg({ type: 'err', text: res.error || 'Gagal impor file pegawai.' });
         }
       }
     } catch {
-      setFormMsg({ type: 'err', text: 'Gagal membaca file CSV pegawai.' });
+      setFormMsg({ type: 'err', text: 'Gagal membaca file Excel/CSV pegawai.' });
     } finally {
       e.target.value = '';
       setSubmitting(false);
@@ -868,26 +923,36 @@ export function MasterView({
                 </table>
               </div>
 
-              <div className="mt-3.5 grid grid-cols-2 gap-2.5">
+              <div className="mt-3.5 space-y-2">
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleDownloadStudentExcelTemplate}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-emerald-300 bg-white px-3 py-2 text-xs font-extrabold text-emerald-800 shadow-2xs transition-colors hover:bg-emerald-50"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Unduh Template Excel (.xlsx)
+                  </button>
+                  <label className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-2 text-xs font-extrabold text-white transition-colors hover:bg-emerald-700">
+                    <Upload className="h-3.5 w-3.5" />
+                    Upload Excel / CSV Siswa
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
+                      onChange={handleStudentCsvUpload}
+                      disabled={submitting}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
                 <button
                   type="button"
                   onClick={handleDownloadStudentCsvTemplate}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 transition-colors hover:bg-slate-100"
+                  className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white/80 px-2.5 py-1.5 text-[11px] font-bold text-slate-600 transition-colors hover:bg-slate-100"
                 >
-                  <Download className="h-3.5 w-3.5" />
-                  Unduh Template CSV
+                  <FileDown className="h-3 w-3" />
+                  Alternatif: Unduh Template CSV (Kolom Terpisah Otomatis)
                 </button>
-                <label className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-emerald-700">
-                  <Upload className="h-3.5 w-3.5" />
-                  Upload CSV Siswa
-                  <input
-                    type="file"
-                    accept=".csv,text/csv"
-                    onChange={handleStudentCsvUpload}
-                    disabled={submitting}
-                    className="hidden"
-                  />
-                </label>
               </div>
             </section>
 
@@ -1240,26 +1305,36 @@ export function MasterView({
                 </table>
               </div>
 
-              <div className="mt-3.5 grid grid-cols-2 gap-2.5">
+              <div className="mt-3.5 space-y-2">
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleDownloadLaptopExcelTemplate}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-blue-300 bg-white px-3 py-2 text-xs font-extrabold text-blue-800 shadow-2xs transition-colors hover:bg-blue-50"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Unduh Template Excel (.xlsx)
+                  </button>
+                  <label className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-blue-700 px-3 py-2 text-xs font-extrabold text-white transition-colors hover:bg-blue-800">
+                    <Upload className="h-3.5 w-3.5" />
+                    Upload Excel / CSV Laptop
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
+                      onChange={handleLaptopCsvUpload}
+                      disabled={submitting}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
                 <button
                   type="button"
                   onClick={handleDownloadLaptopCsvTemplate}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 transition-colors hover:bg-slate-100"
+                  className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white/80 px-2.5 py-1.5 text-[11px] font-bold text-slate-600 transition-colors hover:bg-slate-100"
                 >
-                  <Download className="h-3.5 w-3.5" />
-                  Unduh Template CSV
+                  <FileDown className="h-3 w-3" />
+                  Alternatif: Unduh Template CSV (Kolom Terpisah Otomatis)
                 </button>
-                <label className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-blue-700 px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-blue-800">
-                  <Upload className="h-3.5 w-3.5" />
-                  Upload CSV Laptop
-                  <input
-                    type="file"
-                    accept=".csv,text/csv"
-                    onChange={handleLaptopCsvUpload}
-                    disabled={submitting}
-                    className="hidden"
-                  />
-                </label>
               </div>
             </section>
 
@@ -1532,26 +1607,36 @@ export function MasterView({
                 </table>
               </div>
 
-              <div className="mt-3.5 grid grid-cols-2 gap-2.5">
+              <div className="mt-3.5 space-y-2">
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleDownloadStaffExcelTemplate}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs font-extrabold text-amber-900 shadow-2xs transition-colors hover:bg-amber-50"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Unduh Template Excel (.xlsx)
+                  </button>
+                  <label className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-amber-600 px-3 py-2 text-xs font-extrabold text-white transition-colors hover:bg-amber-700">
+                    <Upload className="h-3.5 w-3.5" />
+                    Upload Excel / CSV Pegawai
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
+                      onChange={handleStaffCsvUpload}
+                      disabled={submitting}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
                 <button
                   type="button"
                   onClick={handleDownloadStaffCsvTemplate}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 transition-colors hover:bg-slate-100"
+                  className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white/80 px-2.5 py-1.5 text-[11px] font-bold text-slate-600 transition-colors hover:bg-slate-100"
                 >
-                  <Download className="h-3.5 w-3.5" />
-                  Unduh Template CSV
+                  <FileDown className="h-3 w-3" />
+                  Alternatif: Unduh Template CSV (Kolom Terpisah Otomatis)
                 </button>
-                <label className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-amber-600 px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-amber-700">
-                  <Upload className="h-3.5 w-3.5" />
-                  Upload CSV Pegawai
-                  <input
-                    type="file"
-                    accept=".csv,text/csv"
-                    onChange={handleStaffCsvUpload}
-                    disabled={submitting}
-                    className="hidden"
-                  />
-                </label>
               </div>
             </section>
 

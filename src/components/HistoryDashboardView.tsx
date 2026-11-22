@@ -193,7 +193,7 @@ export function HistoryDashboardView({
 
   const handleExportCsv = () => {
     const header =
-      'Kode Siswa,Nama Siswa,Kelas,Wilayah,Kode Laptop,Jenis Transaksi,Sesi / Peruntukan,Catatan Pulang,Waktu Ambil,Batas Jam Telat,Waktu Kembali,Durasi,Ketepatan,Guru Piket Ambil,Guru Piket Kembali\n';
+      '\uFEFFsep=;\r\nKode Siswa;Nama Siswa;Kelas;Wilayah;Kode Laptop;Jenis Transaksi;Sesi / Peruntukan;Catatan Pulang;Waktu Ambil;Batas Jam Telat;Waktu Kembali;Durasi;Ketepatan;Guru Piket Ambil;Guru Piket Kembali\r\n';
     const rows = filteredHistory
       .map((tx) => {
         const st = studentMap.get(tx.student_id);
@@ -220,9 +220,9 @@ export function HistoryDashboardView({
           `"${punctuality}"`,
           `"${tx.piket_name}"`,
           `"${tx.return_piket_name || '-'}"`,
-        ].join(',');
+        ].join(';');
       })
-      .join('\n');
+      .join('\r\n');
 
     const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
