@@ -86,6 +86,7 @@ export interface Student {
   class: string;
   wilayah: Wilayah;
   photo_url: string | null;
+  bimbel_days?: string[];
   late_count: number;
   is_suspended: boolean;
   suspended_until: string | null;
@@ -207,7 +208,7 @@ export interface PrintSettings {
   includeBarcodeOnCard: boolean;
 }
 
-export type ActivePage = 'scan' | 'database' | 'manajemen' | 'print';
+export type ActivePage = 'scan' | 'database' | 'suspend' | 'manajemen' | 'print';
 export type KioskWizardStep = 'piket_login' | 'select_session' | 'scan_student' | 'validation_panel';
 
 export interface KioskPersistedState {

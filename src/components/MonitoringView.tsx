@@ -1,23 +1,31 @@
-import { useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Ban,
   BookOpen,
+  Calendar,
   CheckCircle2,
   Clock,
   Database,
   Download,
+  Edit3,
+  FileDown,
   Home,
   Laptop as LaptopIcon,
+  Plus,
   RotateCcw,
+  Save,
   Search,
   ShieldAlert,
+  Trash2,
   Unlock,
+  X,
 } from 'lucide-react';
 import {
   DailySessionConfig,
   Laptop,
   MAX_LATE_STRIKES,
+  PrintSettings,
   Student,
   Transaction,
   TransactionType,
@@ -25,19 +33,68 @@ import {
   WILAYAH_LABELS,
 } from '../types/models';
 import {
+  BIMBEL_DAY_OPTIONS,
+  formatBimbelDays,
   formatDateOnly,
   formatDateTimeID,
   formatDuration,
   formatTimeOnly,
+  getDefaultReturnDateInput,
   isStudentCurrentlySuspended,
+  parseBimbelDays,
 } from '../lib/store';
+import { exportUsageReportPdf } from '../lib/pdfGenerator';
 import { SuspendStudentModal } from './SuspendStudentModal';
+
+export type DatabaseSectionTab = 'pemakaian_lengkap' | 'tracking_laptop' | 'suspend_siswa';
+type UsageFilterMode = 'all' | 'active' | 'returned' | 'pulang' | 'late';
+type ReportPeriodMode = 'semua' | 'harian' | 'bulanan' | 'tahunan';
+
+const MONTH_NAMES_ID = [
+  'Januari',
+  'Februari',
+  'Maret',
+  'April',
+  'Mei',
+  'Juni',
+  'Juli',
+  'Agustus',
+  'September',
+  'Oktober',
+  'November',
+  'Desember',
+];
+
+function toLocalDateKey(isoStr: string): string {
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return '';
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function toLocalMonthKey(isoStr: string): string {
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return '';
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${yyyy}-${mm}`;
+}
+
+function toLocalYearKey(isoStr: string): string {
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return '';
+  return String(d.getFullYear());
+}
 
 interface MonitoringViewProps {
   students: Student[];
   laptops: Laptop[];
   dailySessions: DailySessionConfig[];
   transactions: Transaction[];
+  printSettings?: PrintSettings;
+  initialSectionTab?: DatabaseSectionTab;
   onManualReturn: (
     studentId: string,
     laptopId: string,
@@ -48,21 +105,45 @@ interface MonitoringViewProps {
     payload: { suspended_until: string; reason: string }
   ) => Promise<void>;
   onResetSanction: (studentId: string) => Promise<void>;
+  onDeleteTransaction?: (txId: string) => Promise<void>;
+  onClearTransactions?: (payload: {
+    mode: 'all' | 'returned' | 'selected';
+    txIds?: string[];
+  }) => Promise<void>;
+  onUpdateStudent?: (
+    studentId: string,
+    data: {
+      name: string;
+      class: string;
+      wilayah: Wilayah;
+      photo_url?: string | null;
+      bimbel_days?: string[];
+    }
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onDeleteStudent?: (studentId: string) => Promise<void>;
 }
-
-type DatabaseSectionTab = 'pemakaian_lengkap' | 'tracking_laptop' | 'suspend_siswa';
-type UsageFilterMode = 'all' | 'active' | 'returned' | 'pulang' | 'late';
 
 export function MonitoringView({
   students,
   laptops,
   dailySessions,
   transactions,
+  printSettings,
+  initialSectionTab = 'pemakaian_lengkap',
   onManualReturn,
   onSuspendStudent,
   onResetSanction,
+  onDeleteTransaction,
+  onClearTransactions,
+  onUpdateStudent,
+  onDeleteStudent,
 }: MonitoringViewProps) {
-  const [sectionTab, setSectionTab] = useState<DatabaseSectionTab>('pemakaian_lengkap');
+  const [sectionTab, setSectionTab] = useState<DatabaseSectionTab>(initialSectionTab);
+
+  useEffect(() => {
+    setSectionTab(initialSectionTab);
+  }, [initialSectionTab]);
+
   const [usageFilter, setUsageFilter] = useState<UsageFilterMode>('all');
   const [wilayahFilter, setWilayahFilter] = useState<'ALL' | Wilayah>('ALL');
   const [typeFilter, setTypeFilter] = useState<'ALL' | TransactionType>('ALL');
@@ -73,8 +154,62 @@ export function MonitoringView({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [suspendModalStudent, setSuspendModalStudent] = useState<Student | null>(null);
 
+  // Categorized Report Period State (Harian / Bulanan / Tahunan / Semua)
+  const now = useMemo(() => new Date(), []);
+  const defaultTodayKey = useMemo(() => toLocalDateKey(now.toISOString()), [now]);
+  const defaultMonthKey = useMemo(() => toLocalMonthKey(now.toISOString()), [now]);
+  const defaultYearKey = useMemo(() => String(now.getFullYear()), [now]);
+
+  const [reportPeriodMode, setReportPeriodMode] = useState<ReportPeriodMode>('semua');
+  const [selectedDate, setSelectedDate] = useState<string>(defaultTodayKey);
+  const [selectedMonth, setSelectedMonth] = useState<string>(defaultMonthKey);
+  const [selectedYear, setSelectedYear] = useState<string>(defaultYearKey);
+  const [exportingPdf, setExportingPdf] = useState(false);
+
+  // Recap Delete / Clear confirmation UI state
+  const [showClearConfirmPanel, setShowClearConfirmPanel] = useState(false);
+  const [clearBusy, setClearBusy] = useState(false);
+  const [feedbackBanner, setFeedbackBanner] = useState<{
+    type: 'ok' | 'err';
+    text: string;
+  } | null>(null);
+
+  // Dedicated Suspend Menu Controls (Quick Add to Suspend + Filter + Edit Student)
+  const [suspendListFilter, setSuspendListFilter] = useState<'all' | 'suspended' | 'late'>('all');
+  const [quickSuspendStudentId, setQuickSuspendStudentId] = useState<string>('');
+  const [quickSuspendUntil, setQuickSuspendUntil] = useState<string>(() =>
+    getDefaultReturnDateInput(7)
+  );
+  const [quickSuspendReason, setQuickSuspendReason] = useState<string>(
+    'Sanksi disiplin / pelanggaran aturan peminjaman laptop'
+  );
+  const [quickSuspendBusy, setQuickSuspendBusy] = useState(false);
+
+  // Edit Student modal inside Suspend Menu
+  const [editingStudent, setEditingStudent] = useState<Student | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editClass, setEditClass] = useState('');
+  const [editWilayah, setEditWilayah] = useState<Wilayah>('putra');
+  const [editBimbelDays, setEditBimbelDays] = useState<string[]>([]);
+  const [editStudentBusy, setEditStudentBusy] = useState(false);
+  const [confirmDeleteStudentId, setConfirmDeleteStudentId] = useState<string | null>(null);
+
   const studentMap = useMemo(() => new Map(students.map((s) => [s.id, s])), [students]);
   const laptopMap = useMemo(() => new Map(laptops.map((l) => [l.id, l])), [laptops]);
+
+  // Available years from transactions + current year range
+  const availableYears = useMemo(() => {
+    const years = new Set<string>([
+      String(now.getFullYear() - 1),
+      String(now.getFullYear()),
+      String(now.getFullYear() + 1),
+    ]);
+    transactions.forEach((tx) => {
+      const y = toLocalYearKey(tx.borrow_time);
+      if (y) years.add(y);
+    });
+    return Array.from(years).sort((a, b) => Number(b) - Number(a));
+  }, [transactions, now]);
 
   // Scope laptop counters to selected Wilayah
   const scopedLaptops = useMemo(() => {
@@ -114,6 +249,11 @@ export function MonitoringView({
           (wilayahFilter === 'ALL' || tx.wilayah === wilayahFilter)
       ).length,
     [transactions, wilayahFilter]
+  );
+
+  const suspendedStudentsCount = useMemo(
+    () => students.filter((s) => isStudentCurrentlySuspended(s)).length,
+    [students]
   );
 
   // Live Recap of Active Laptops Grouped by Session (Khusus Admin)
@@ -206,7 +346,24 @@ export function MonitoringView({
     };
   }, [transactions, dailySessions, wilayahFilter, studentMap, laptopMap]);
 
-  // Complete usage transaction list
+  // Human-readable active period label
+  const activePeriodLabel = useMemo(() => {
+    if (reportPeriodMode === 'harian') {
+      return selectedDate ? formatDateOnly(`${selectedDate}T12:00:00`) : 'Hari Ini';
+    }
+    if (reportPeriodMode === 'bulanan') {
+      const [y, m] = selectedMonth.split('-');
+      const mIdx = Number(m) - 1;
+      const monthName = MONTH_NAMES_ID[mIdx] || selectedMonth;
+      return `${monthName} ${y || ''}`.trim();
+    }
+    if (reportPeriodMode === 'tahunan') {
+      return `Tahun ${selectedYear}`;
+    }
+    return 'Semua Waktu';
+  }, [reportPeriodMode, selectedDate, selectedMonth, selectedYear]);
+
+  // Complete usage transaction list filtered by Period (Harian / Bulanan / Tahunan / Semua) + Wilayah + Status + Search
   const filteredUsageList = useMemo(() => {
     const q = search.trim().toLowerCase();
     return [...transactions]
@@ -218,6 +375,15 @@ export function MonitoringView({
         if (usageFilter === 'returned' && tx.status !== 'returned') return false;
         if (usageFilter === 'pulang' && tx.transaction_type !== 'pulang') return false;
         if (usageFilter === 'late' && !tx.is_late) return false;
+
+        // Filter by Period Mode (Harian, Bulanan, Tahunan)
+        if (reportPeriodMode === 'harian' && selectedDate) {
+          if (toLocalDateKey(tx.borrow_time) !== selectedDate) return false;
+        } else if (reportPeriodMode === 'bulanan' && selectedMonth) {
+          if (toLocalMonthKey(tx.borrow_time) !== selectedMonth) return false;
+        } else if (reportPeriodMode === 'tahunan' && selectedYear) {
+          if (toLocalYearKey(tx.borrow_time) !== selectedYear) return false;
+        }
 
         if (!q) return true;
         const st = studentMap.get(tx.student_id);
@@ -240,10 +406,113 @@ export function MonitoringView({
     usageFilter,
     wilayahFilter,
     typeFilter,
+    reportPeriodMode,
+    selectedDate,
+    selectedMonth,
+    selectedYear,
     search,
     studentMap,
     laptopMap,
   ]);
+
+  // Categorized Breakdown Summary for Harian (per Sesi), Bulanan (per Hari), Tahunan (per Bulan), or Semua (per Bulan/Tahun)
+  const periodBreakdown = useMemo(() => {
+    if (reportPeriodMode === 'harian') {
+      const sessionGroups = [
+        { key: 'siang', label: 'Sesi Siang' },
+        { key: 'sore', label: 'Sesi Sore' },
+        { key: 'malam', label: 'Sesi Malam' },
+        { key: 'kegiatan_lainnya', label: 'Kegiatan Lainnya' },
+        { key: 'pulang', label: 'Izin Kepulangan' },
+      ];
+      return sessionGroups.map((g) => {
+        const items = filteredUsageList.filter((tx) => {
+          if (g.key === 'pulang') return tx.transaction_type === 'pulang';
+          if (tx.transaction_type === 'pulang') return false;
+          if (g.key === 'kegiatan_lainnya') {
+            return tx.daily_session === 'kegiatan_lainnya' || Boolean(tx.custom_activity);
+          }
+          return tx.daily_session === g.key;
+        });
+        return {
+          label: g.label,
+          total: items.length,
+          harian: items.filter((t) => t.transaction_type !== 'pulang').length,
+          pulang: items.filter((t) => t.transaction_type === 'pulang').length,
+          late: items.filter((t) => t.is_late).length,
+        };
+      });
+    }
+
+    if (reportPeriodMode === 'bulanan') {
+      const byDay = new Map<
+        string,
+        { label: string; total: number; harian: number; pulang: number; late: number }
+      >();
+      filteredUsageList.forEach((tx) => {
+        const dKey = toLocalDateKey(tx.borrow_time);
+        if (!dKey) return;
+        const existing = byDay.get(dKey) || {
+          label: formatDateOnly(`${dKey}T12:00:00`),
+          total: 0,
+          harian: 0,
+          pulang: 0,
+          late: 0,
+        };
+        existing.total += 1;
+        if (tx.transaction_type === 'pulang') existing.pulang += 1;
+        else existing.harian += 1;
+        if (tx.is_late) existing.late += 1;
+        byDay.set(dKey, existing);
+      });
+      return Array.from(byDay.entries())
+        .sort((a, b) => b[0].localeCompare(a[0]))
+        .map(([, val]) => val);
+    }
+
+    if (reportPeriodMode === 'tahunan') {
+      return MONTH_NAMES_ID.map((monthName, idx) => {
+        const monthKey = `${selectedYear}-${String(idx + 1).padStart(2, '0')}`;
+        const items = filteredUsageList.filter(
+          (tx) => toLocalMonthKey(tx.borrow_time) === monthKey
+        );
+        return {
+          label: `${monthName} ${selectedYear}`,
+          total: items.length,
+          harian: items.filter((t) => t.transaction_type !== 'pulang').length,
+          pulang: items.filter((t) => t.transaction_type === 'pulang').length,
+          late: items.filter((t) => t.is_late).length,
+        };
+      }).filter((b) => b.total > 0);
+    }
+
+    // Semua Waktu: group by Month-Year
+    const byMonth = new Map<
+      string,
+      { label: string; total: number; harian: number; pulang: number; late: number }
+    >();
+    filteredUsageList.forEach((tx) => {
+      const mKey = toLocalMonthKey(tx.borrow_time);
+      if (!mKey) return;
+      const [y, m] = mKey.split('-');
+      const label = `${MONTH_NAMES_ID[Number(m) - 1] || m} ${y}`;
+      const existing = byMonth.get(mKey) || {
+        label,
+        total: 0,
+        harian: 0,
+        pulang: 0,
+        late: 0,
+      };
+      existing.total += 1;
+      if (tx.transaction_type === 'pulang') existing.pulang += 1;
+      else existing.harian += 1;
+      if (tx.is_late) existing.late += 1;
+      byMonth.set(mKey, existing);
+    });
+    return Array.from(byMonth.entries())
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([, val]) => val);
+  }, [reportPeriodMode, filteredUsageList, selectedYear]);
 
   // Complete laptop tracking records (all laptops with active/last transaction, owner, usage count)
   const laptopTrackingRecords = useMemo(() => {
@@ -308,11 +577,17 @@ export function MonitoringView({
     return students
       .filter((s) => (wilayahFilter === 'ALL' ? true : s.wilayah === wilayahFilter))
       .filter((s) => {
+        if (suspendListFilter === 'suspended') return isStudentCurrentlySuspended(s);
+        if (suspendListFilter === 'late') return s.late_count > 0 || isStudentCurrentlySuspended(s);
+        return true;
+      })
+      .filter((s) => {
         if (!q) return true;
         return (
           s.name.toLowerCase().includes(q) ||
           s.student_code.toLowerCase().includes(q) ||
-          s.class.toLowerCase().includes(q)
+          s.class.toLowerCase().includes(q) ||
+          formatBimbelDays(s.bimbel_days).toLowerCase().includes(q)
         );
       })
       .sort((a, b) => {
@@ -321,7 +596,7 @@ export function MonitoringView({
         if (aSusp !== bSusp) return bSusp - aSusp;
         return b.late_count - a.late_count;
       });
-  }, [students, wilayahFilter, search]);
+  }, [students, wilayahFilter, suspendListFilter, search]);
 
   const handleReturnClick = async (tx: Transaction, lateMinutes = 0) => {
     setBusyId(tx.id);
@@ -332,9 +607,75 @@ export function MonitoringView({
     }
   };
 
+  const handleDeleteSingleTx = async (txId: string) => {
+    if (!onDeleteTransaction) return;
+    setBusyId(txId);
+    try {
+      await onDeleteTransaction(txId);
+      setFeedbackBanner({
+        type: 'ok',
+        text: '1 data rekapitulasi pemakaian berhasil dihapus.',
+      });
+    } catch {
+      setFeedbackBanner({
+        type: 'err',
+        text: 'Gagal menghapus data rekapitulasi.',
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleClearRecapAction = async (mode: 'all' | 'returned' | 'selected') => {
+    if (!onClearTransactions) return;
+    setClearBusy(true);
+    try {
+      const txIds = mode === 'selected' ? filteredUsageList.map((t) => t.id) : undefined;
+      await onClearTransactions({ mode, txIds });
+      setShowClearConfirmPanel(false);
+      setFeedbackBanner({
+        type: 'ok',
+        text:
+          mode === 'all'
+            ? 'Seluruh data rekapitulasi berhasil dikosongkan dan status laptop telah di-reset.'
+            : mode === 'returned'
+            ? 'Seluruh rekapitulasi yang sudah dikembalikan berhasil dihapus.'
+            : `Data rekapitulasi pada periode/filter (${txIds?.length || 0} data) berhasil dihapus.`,
+      });
+    } catch {
+      setFeedbackBanner({
+        type: 'err',
+        text: 'Gagal mengosongkan data rekapitulasi.',
+      });
+    } finally {
+      setClearBusy(false);
+    }
+  };
+
+  const handleExportUsagePdf = async () => {
+    setExportingPdf(true);
+    try {
+      const wilayahLabel =
+        wilayahFilter === 'ALL' ? 'Semua Wilayah (Putra & Putri)' : WILAYAH_LABELS[wilayahFilter];
+      await exportUsageReportPdf({
+        transactions: filteredUsageList,
+        students,
+        laptops,
+        settings: printSettings,
+        periodType: reportPeriodMode,
+        periodLabel: activePeriodLabel,
+        wilayahLabel,
+        periodBreakdown,
+      });
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
   const handleExportUsageCsv = () => {
     const headers = [
       'ID Transaksi',
+      'Kategori Periode',
       'Wilayah',
       'Jenis Pemakaian',
       'Status Kepulangan / Pemakaian',
@@ -343,6 +684,7 @@ export function MonitoringView({
       'Kode Siswa',
       'Nama Siswa',
       'Kelas',
+      'Jadwal Bimbel Siswa',
       'Kode Laptop',
       'Merk Laptop',
       'Waktu Ambil',
@@ -366,6 +708,7 @@ export function MonitoringView({
           : 'SUDAH DIKEMBALIKAN';
       return [
         tx.id,
+        `${reportPeriodMode.toUpperCase()} (${activePeriodLabel})`,
         WILAYAH_LABELS[tx.wilayah],
         tx.transaction_type === 'pulang' ? 'Kepulangan (Bawa Pulang)' : 'Penggunaan Harian',
         statusLabel,
@@ -374,6 +717,7 @@ export function MonitoringView({
         st?.student_code || '-',
         st?.name || '-',
         st?.class || '-',
+        formatBimbelDays(st?.bimbel_days),
         lp?.asset_code || '-',
         lp?.brand_model || '-',
         formatDateTimeID(tx.borrow_time),
@@ -392,7 +736,8 @@ export function MonitoringView({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `database-pemakaian-laptop-lengkap-${new Date().toISOString().slice(0, 10)}.csv`;
+    const safePeriod = activePeriodLabel.replace(/[^a-zA-Z0-9_-]+/g, '-');
+    a.download = `laporan-pemakaian-${reportPeriodMode}-${safePeriod}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -406,6 +751,7 @@ export function MonitoringView({
       'Nama Siswa Pemilik',
       'Kelas',
       'Wilayah',
+      'Jadwal Bimbel Siswa',
       'Sesi / Keperluan Terakhir',
       'Waktu Ambil Terakhir',
       'Waktu Kembali Terakhir',
@@ -425,6 +771,7 @@ export function MonitoringView({
       rec.owner?.name || '-',
       rec.owner?.class || '-',
       rec.owner ? WILAYAH_LABELS[rec.owner.wilayah] : '-',
+      rec.owner ? formatBimbelDays(rec.owner.bimbel_days) : '-',
       rec.lastTx?.purpose || 'Belum Pernah Dipakai',
       rec.lastTx ? formatDateTimeID(rec.lastTx.borrow_time) : '-',
       rec.lastTx?.return_time
@@ -448,21 +795,121 @@ export function MonitoringView({
     URL.revokeObjectURL(url);
   };
 
+  // Quick Add Student to Suspend from the Suspend Menu
+  const handleQuickSuspendSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!quickSuspendStudentId || !quickSuspendUntil) return;
+    setQuickSuspendBusy(true);
+    try {
+      const isoEnd = new Date(`${quickSuspendUntil}T23:59:59`).toISOString();
+      await onSuspendStudent(quickSuspendStudentId, {
+        suspended_until: isoEnd,
+        reason: quickSuspendReason.trim() || 'Di-suspend oleh Admin',
+      });
+      const st = studentMap.get(quickSuspendStudentId);
+      setQuickSuspendStudentId('');
+      setSuspendListFilter('suspended');
+      setFeedbackBanner({
+        type: 'ok',
+        text: `Siswa ${st?.name || ''} (${st?.student_code || ''}) berhasil ditambahkan ke daftar Suspend sampai ${formatDateOnly(isoEnd)}. Saat di-scan, siswa ini otomatis ditolak sistem.`,
+      });
+    } finally {
+      setQuickSuspendBusy(false);
+    }
+  };
+
+  const openEditStudentModal = (st: Student) => {
+    setEditingStudent(st);
+    setEditName(st.name);
+    setEditClass(st.class);
+    setEditWilayah(st.wilayah);
+    setEditBimbelDays(parseBimbelDays(st.bimbel_days));
+  };
+
+  const toggleEditBimbelDay = (day: string) => {
+    setEditBimbelDays((prev) =>
+      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]
+    );
+  };
+
+  const handleSaveEditedStudent = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!editingStudent || !onUpdateStudent) return;
+    setEditStudentBusy(true);
+    try {
+      const res = await onUpdateStudent(editingStudent.id, {
+        name: editName.trim(),
+        class: editClass.trim(),
+        wilayah: editWilayah,
+        photo_url: editingStudent.photo_url,
+        bimbel_days: parseBimbelDays(editBimbelDays),
+      });
+      if (res.ok) {
+        setFeedbackBanner({
+          type: 'ok',
+          text: `Data & jadwal bimbel siswa ${editName.trim()} berhasil diperbarui.`,
+        });
+        setEditingStudent(null);
+      } else {
+        setFeedbackBanner({
+          type: 'err',
+          text: res.error || 'Gagal memperbarui data siswa.',
+        });
+      }
+    } finally {
+      setEditStudentBusy(false);
+    }
+  };
+
+  const handleConfirmDeleteStudent = async (studentId: string) => {
+    if (!onDeleteStudent) return;
+    setBusyId(studentId);
+    try {
+      await onDeleteStudent(studentId);
+      setConfirmDeleteStudentId(null);
+      setFeedbackBanner({
+        type: 'ok',
+        text: 'Data siswa berhasil dihapus.',
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header Banner */}
-      <div className="rounded-2xl bg-gradient-to-r from-blue-900 via-indigo-800 to-violet-800 p-5 text-white shadow-md sm:p-6">
+      <div
+        className={`rounded-2xl p-5 text-white shadow-md sm:p-6 ${
+          sectionTab === 'suspend_siswa'
+            ? 'bg-gradient-to-r from-rose-900 via-red-800 to-amber-900'
+            : 'bg-gradient-to-r from-blue-900 via-indigo-800 to-violet-800'
+        }`}
+      >
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p className="flex items-center gap-1.5 text-xs font-extrabold tracking-wider text-cyan-300 uppercase">
-              <Database className="h-3.5 w-3.5" />
-              Menu Database &amp; Tracking Administrator
+              {sectionTab === 'suspend_siswa' ? (
+                <>
+                  <ShieldAlert className="h-3.5 w-3.5 text-amber-300" />
+                  Menu Khusus Administrator · Kontrol Blokir Scan &amp; Sanksi Siswa
+                </>
+              ) : (
+                <>
+                  <Database className="h-3.5 w-3.5" />
+                  Menu Database, Rekapitulasi Harian/Bulanan/Tahunan &amp; Tracking
+                </>
+              )}
             </p>
             <h2 className="mt-1 text-2xl font-extrabold tracking-tight">
-              Database Pemakaian Lengkap &amp; Tracking Semua Unit Laptop
+              {sectionTab === 'suspend_siswa'
+                ? 'Manajemen Siswa di-Suspend (Blokir Scan, Tambah, Edit & Cabut Sanksi)'
+                : 'Laporan Pemakaian (Harian / Bulanan / Tahunan), PDF & Tracking Laptop'}
             </h2>
             <p className="mt-1 text-xs text-blue-100 sm:text-sm">
-              Lihat seluruh data pemakaian harian &amp; kepulangan secara lengkap, pantau lokasi/status setiap unit laptop, serta kelola sanksi suspend siswa.
+              {sectionTab === 'suspend_siswa'
+                ? 'Siswa yang berada dalam daftar Suspend otomatis ditolak saat kartu siswanya di-scan di pos peminjaman. Admin dapat menambah, mengubah batas waktu, mencabut suspend, atau mengedit jadwal bimbel siswa.'
+                : 'Filter laporan setiap Hari, Bulan, dan Tahun, unduh laporan dalam bentuk PDF/CSV, kosongkan rekapitulasi, serta pantau seluruh unit laptop.'}
             </p>
           </div>
 
@@ -491,6 +938,25 @@ export function MonitoringView({
         </div>
       </div>
 
+      {feedbackBanner && (
+        <div
+          className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-3 text-xs font-bold shadow-xs ${
+            feedbackBanner.type === 'ok'
+              ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+              : 'border-rose-200 bg-rose-50 text-rose-800'
+          }`}
+        >
+          <span>{feedbackBanner.text}</span>
+          <button
+            type="button"
+            onClick={() => setFeedbackBanner(null)}
+            className="rounded-lg p-1 hover:bg-black/5"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {/* Top 5 Summary Counters */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5 sm:gap-4">
         <div className="rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-white p-4 shadow-2xs">
@@ -511,10 +977,10 @@ export function MonitoringView({
             {activeHomeCount}
           </p>
         </div>
-        <div className="rounded-2xl border border-cyan-200 bg-gradient-to-br from-cyan-50 to-white p-4 shadow-2xs">
-          <p className="text-xs font-bold text-cyan-700">Kembali dari Pulang</p>
-          <p className="mt-1 font-mono text-2xl font-extrabold text-cyan-800 tabular-nums">
-            {returnedHomeCount}
+        <div className="rounded-2xl border border-rose-200 bg-gradient-to-br from-rose-50 to-white p-4 shadow-2xs">
+          <p className="text-xs font-bold text-rose-700">Siswa di-Suspend</p>
+          <p className="mt-1 font-mono text-2xl font-extrabold text-rose-700 tabular-nums">
+            {suspendedStudentsCount}
           </p>
         </div>
         <div className="col-span-2 rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-white p-4 shadow-2xs sm:col-span-1">
@@ -538,7 +1004,7 @@ export function MonitoringView({
             }`}
           >
             <Database className="h-4 w-4" />
-            1. Data Pemakaian Lengkap &amp; Rekap Sesi ({transactions.length})
+            1. Laporan &amp; Rekapitulasi Pemakaian ({transactions.length})
           </button>
 
           <button
@@ -551,7 +1017,7 @@ export function MonitoringView({
             }`}
           >
             <LaptopIcon className="h-4 w-4" />
-            2. Data Semua Laptop &amp; Tracking Unit ({laptops.length})
+            2. Tracking Semua Laptop ({laptops.length})
           </button>
 
           <button
@@ -564,7 +1030,7 @@ export function MonitoringView({
             }`}
           >
             <ShieldAlert className="h-4 w-4" />
-            3. Status Suspend &amp; Sanksi Siswa ({students.length})
+            3. Menu Siswa di-Suspend ({suspendedStudentsCount} Aktif)
           </button>
         </div>
 
@@ -581,10 +1047,241 @@ export function MonitoringView({
       </div>
 
       {/* =================================================================== */}
-      {/* TAB 1: DATA PEMAKAIAN SECARA LENGKAP & REKAP SESI AKTIF             */}
+      {/* TAB 1: DATA PEMAKAIAN, KATEGORISASI HARI/BULAN/TAHUN, PDF & HAPUS   */}
       {/* =================================================================== */}
       {sectionTab === 'pemakaian_lengkap' && (
         <div className="space-y-6">
+          {/* PANEL KATEGORISASI LAPORAN SETIAP HARI, BULAN, DAN TAHUN + UNDUH PDF & HAPUS REKAP */}
+          <section className="rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50/60 via-white to-blue-50/40 p-5 shadow-xs">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <span className="inline-flex items-center gap-1.5 rounded-md bg-indigo-100 px-2.5 py-0.5 text-[11px] font-extrabold text-indigo-900 uppercase">
+                  <Calendar className="h-3.5 w-3.5 text-indigo-700" />
+                  Kategorisasi Laporan &amp; Rekapitulasi
+                </span>
+                <h3 className="mt-1 text-base font-extrabold text-slate-900">
+                  Filter Laporan Setiap Hari, Bulan, dan Tahun · Unduh PDF &amp; Kosongkan Rekap
+                </h3>
+                <p className="text-xs text-slate-600">
+                  Pilih kategori waktu laporan untuk melihat rekapitulasi terperinci, cetak/download laporan PDF, atau hapus rekapitulasi untuk mengosongkan data.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={exportingPdf}
+                  onClick={handleExportUsagePdf}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-red-700 px-4 py-2.5 text-xs font-extrabold text-white shadow-xs transition-all hover:from-rose-700 hover:to-red-800 disabled:opacity-50"
+                >
+                  <FileDown className="h-4 w-4" />
+                  {exportingPdf
+                    ? 'Menyiapkan PDF...'
+                    : `Download Laporan PDF (${filteredUsageList.length})`}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportUsageCsv}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3.5 py-2.5 text-xs font-extrabold text-white hover:bg-slate-800"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Unduh CSV ({filteredUsageList.length})
+                </button>
+
+                {onClearTransactions && (
+                  <button
+                    type="button"
+                    onClick={() => setShowClearConfirmPanel((v) => !v)}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-xs font-extrabold text-rose-700 transition-colors hover:bg-rose-100"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Hapus / Kosongkan Rekapitulasi
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Inline Confirmation Panel for Clearing Recapitulation Data */}
+            {showClearConfirmPanel && onClearTransactions && (
+              <div className="mt-4 rounded-2xl border-2 border-rose-300 bg-rose-50/90 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="flex items-center gap-1.5 text-xs font-extrabold text-rose-900 uppercase">
+                      <AlertTriangle className="h-4 w-4 text-rose-600" />
+                      Konfirmasi Hapus &amp; Kosongkan Data Rekapitulasi
+                    </p>
+                    <p className="mt-0.5 text-xs text-rose-800">
+                      Pilih metode pengosongan data rekapitulasi. Unit laptop yang terkait dengan data yang dihapus akan otomatis dikembalikan statusnya menjadi Tersedia di Lab.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowClearConfirmPanel(false)}
+                    className="self-start rounded-lg bg-white px-2.5 py-1 text-xs font-bold text-slate-600 hover:bg-slate-100 sm:self-auto"
+                  >
+                    Batal
+                  </button>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2.5">
+                  <button
+                    type="button"
+                    disabled={clearBusy || filteredUsageList.length === 0}
+                    onClick={() => handleClearRecapAction('selected')}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-amber-600 px-3.5 py-2 text-xs font-extrabold text-white shadow-2xs hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Hapus Data Periode/Filter Ini ({filteredUsageList.length} Data)
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={
+                      clearBusy ||
+                      transactions.filter((t) => t.status === 'returned').length === 0
+                    }
+                    onClick={() => handleClearRecapAction('returned')}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-700 px-3.5 py-2 text-xs font-extrabold text-white shadow-2xs hover:bg-indigo-800 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Hapus yang Sudah Kembali Saja (
+                    {transactions.filter((t) => t.status === 'returned').length} Data)
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={clearBusy || transactions.length === 0}
+                    onClick={() => handleClearRecapAction('all')}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-rose-700 px-3.5 py-2 text-xs font-extrabold text-white shadow-2xs hover:bg-rose-800 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Kosongkan Seluruh Rekapitulasi ({transactions.length} Data)
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Period Mode Selector Tabs: Semua Waktu | Per Hari | Per Bulan | Per Tahun */}
+            <div className="mt-4 flex flex-col gap-3 border-t border-indigo-100 pt-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(
+                  [
+                    { id: 'semua', label: 'Semua Waktu' },
+                    { id: 'harian', label: 'Laporan Harian (Per Hari)' },
+                    { id: 'bulanan', label: 'Laporan Bulanan (Per Bulan)' },
+                    { id: 'tahunan', label: 'Laporan Tahunan (Per Tahun)' },
+                  ] as const
+                ).map((mode) => (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    onClick={() => setReportPeriodMode(mode.id)}
+                    className={`rounded-xl px-3.5 py-2 text-xs font-extrabold transition-all ${
+                      reportPeriodMode === mode.id
+                        ? 'bg-indigo-700 text-white shadow-xs'
+                        : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Date / Month / Year Picker Input based on selected category */}
+              <div className="flex flex-wrap items-center gap-2">
+                {reportPeriodMode === 'harian' && (
+                  <div className="flex items-center gap-2 rounded-xl border border-indigo-200 bg-white px-3 py-1.5">
+                    <span className="text-xs font-bold text-slate-600">Pilih Tanggal:</span>
+                    <input
+                      type="date"
+                      value={selectedDate}
+                      onChange={(e) => setSelectedDate(e.target.value)}
+                      className="font-mono text-xs font-extrabold text-indigo-900 outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setSelectedDate(defaultTodayKey)}
+                      className="rounded-md bg-indigo-50 px-2 py-0.5 text-[11px] font-bold text-indigo-700 hover:bg-indigo-100"
+                    >
+                      Hari Ini
+                    </button>
+                  </div>
+                )}
+
+                {reportPeriodMode === 'bulanan' && (
+                  <div className="flex items-center gap-2 rounded-xl border border-indigo-200 bg-white px-3 py-1.5">
+                    <span className="text-xs font-bold text-slate-600">Pilih Bulan:</span>
+                    <input
+                      type="month"
+                      value={selectedMonth}
+                      onChange={(e) => setSelectedMonth(e.target.value)}
+                      className="font-mono text-xs font-extrabold text-indigo-900 outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setSelectedMonth(defaultMonthKey)}
+                      className="rounded-md bg-indigo-50 px-2 py-0.5 text-[11px] font-bold text-indigo-700 hover:bg-indigo-100"
+                    >
+                      Bulan Ini
+                    </button>
+                  </div>
+                )}
+
+                {reportPeriodMode === 'tahunan' && (
+                  <div className="flex items-center gap-2 rounded-xl border border-indigo-200 bg-white px-3 py-1.5">
+                    <span className="text-xs font-bold text-slate-600">Pilih Tahun:</span>
+                    <select
+                      value={selectedYear}
+                      onChange={(e) => setSelectedYear(e.target.value)}
+                      className="font-mono text-xs font-extrabold text-indigo-900 outline-none"
+                    >
+                      {availableYears.map((yr) => (
+                        <option key={yr} value={yr}>
+                          Tahun {yr}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <span className="rounded-xl bg-indigo-900 px-3 py-1.5 font-mono text-xs font-extrabold text-amber-300">
+                  Periode Aktif: {activePeriodLabel} ({filteredUsageList.length} Transaksi)
+                </span>
+              </div>
+            </div>
+
+            {/* Ringkasan Rekapitulasi Kategori (Per Sesi / Per Hari / Per Bulan) */}
+            {periodBreakdown.length > 0 && (
+              <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3.5">
+                <p className="text-[11px] font-extrabold tracking-wider text-slate-500 uppercase">
+                  Ringkasan Rekapitulasi Kategori ({activePeriodLabel}):
+                </p>
+                <div className="mt-2 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-5">
+                  {periodBreakdown.slice(0, 10).map((b) => (
+                    <div
+                      key={b.label}
+                      className="rounded-xl border border-slate-200/90 bg-slate-50/70 p-2.5 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="truncate font-extrabold text-slate-800">{b.label}</span>
+                        <span className="rounded-md bg-indigo-700 px-1.5 py-0.5 font-mono text-[11px] font-extrabold text-white">
+                          {b.total}
+                        </span>
+                      </div>
+                      <p className="mt-1 font-mono text-[11px] text-slate-600">
+                        Harian: <strong>{b.harian}</strong> · Pulang: <strong>{b.pulang}</strong> ·{' '}
+                        <span className={b.late > 0 ? 'font-bold text-rose-700' : ''}>
+                          Telat: {b.late}
+                        </span>
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+
           {/* REKAP DATA AKTIF LAPTOP DIPAKAI PADA SETIAP SESI */}
           <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
             <div className="flex flex-col gap-2 border-b border-slate-200 pb-4 sm:flex-row sm:items-center sm:justify-between">
@@ -666,7 +1363,7 @@ export function MonitoringView({
               <div className="flex flex-wrap items-center gap-2">
                 {(
                   [
-                    { id: 'all', label: 'Semua Data Pemakaian' },
+                    { id: 'all', label: 'Semua Status' },
                     { id: 'active', label: `Sedang Dipakai (${activeCount})` },
                     { id: 'returned', label: 'Sudah Dikembalikan' },
                     { id: 'pulang', label: 'Khusus Kepulangan' },
@@ -698,19 +1395,30 @@ export function MonitoringView({
                 </select>
               </div>
 
-              <button
-                type="button"
-                onClick={handleExportUsageCsv}
-                className="inline-flex items-center gap-1.5 self-start rounded-xl bg-slate-900 px-3.5 py-2 text-xs font-extrabold text-white hover:bg-slate-800 lg:self-auto"
-              >
-                <Download className="h-3.5 w-3.5" />
-                Unduh CSV Pemakaian Lengkap ({filteredUsageList.length})
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={exportingPdf}
+                  onClick={handleExportUsagePdf}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 px-3.5 py-2 text-xs font-extrabold text-white hover:bg-rose-700 disabled:opacity-50"
+                >
+                  <FileDown className="h-3.5 w-3.5" />
+                  PDF ({filteredUsageList.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportUsageCsv}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-3.5 py-2 text-xs font-extrabold text-white hover:bg-slate-800"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  CSV ({filteredUsageList.length})
+                </button>
+              </div>
             </div>
 
             {filteredUsageList.length === 0 ? (
               <div className="px-6 py-12 text-center text-xs text-slate-400">
-                Tidak ada data pemakaian laptop yang cocok dengan filter pencarian.
+                Tidak ada data rekapitulasi pemakaian laptop pada periode <strong>{activePeriodLabel}</strong> yang cocok dengan filter pencarian.
               </div>
             ) : (
               <div className="divide-y divide-slate-100">
@@ -748,6 +1456,12 @@ export function MonitoringView({
                           >
                             {WILAYAH_LABELS[tx.wilayah]}
                           </span>
+
+                          {st && (
+                            <span className="rounded-md bg-indigo-50 px-2 py-0.5 text-[10px] font-bold text-indigo-800">
+                              Jadwal: {formatBimbelDays(st.bimbel_days)}
+                            </span>
+                          )}
 
                           {/* Explicit Kepulangan Status Badge */}
                           {isHomeLeave && (
@@ -887,6 +1601,19 @@ export function MonitoringView({
                             )}
                           </>
                         )}
+
+                        {onDeleteTransaction && (
+                          <button
+                            type="button"
+                            disabled={busyId === tx.id}
+                            onClick={() => handleDeleteSingleTx(tx.id)}
+                            title="Hapus baris rekapitulasi ini"
+                            className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs font-bold text-slate-500 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Hapus
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
@@ -945,7 +1672,7 @@ export function MonitoringView({
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/90 text-[11px] font-extrabold text-slate-600 uppercase">
                   <th className="px-4 py-3.5">Kode Tas &amp; Merk Laptop</th>
-                  <th className="px-4 py-3.5">Siswa Pemilik Alokasi</th>
+                  <th className="px-4 py-3.5">Siswa Pemilik &amp; Jadwal Bimbel</th>
                   <th className="px-4 py-3.5">Status Tracking Saat Ini</th>
                   <th className="px-4 py-3.5">Pemakaian Terakhir / Aktif</th>
                   <th className="px-4 py-3.5">Guru Piket Terkait</th>
@@ -987,6 +1714,9 @@ export function MonitoringView({
                               >
                                 {WILAYAH_LABELS[rec.owner.wilayah]}
                               </span>
+                            </p>
+                            <p className="mt-0.5 text-[11px] font-semibold text-indigo-700">
+                              Jadwal Bimbel: {formatBimbelDays(rec.owner.bimbel_days)}
                             </p>
                           </div>
                         ) : (
@@ -1090,100 +1820,402 @@ export function MonitoringView({
       )}
 
       {/* =================================================================== */}
-      {/* TAB 3: DAFTAR SUSPEND SISWA & KONTROL SANKSI                        */}
+      {/* TAB 3: MENU KHUSUS ADMIN — SISWA DI SUSPEND (TAMBAH, EDIT, CABUT)   */}
       {/* =================================================================== */}
       {sectionTab === 'suspend_siswa' && (
-        <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
-          <div className="border-b border-slate-200 bg-slate-50/70 px-5 py-4">
-            <h3 className="text-sm font-extrabold text-slate-900">
-              Manajemen Suspend Siswa &amp; Batas Tanggal Sanksi
-            </h3>
-            <p className="text-xs text-slate-500">
-              Pilih siswa mana yang di-suspend dan tentukan batas tanggal berakhirnya suspend.
-            </p>
-          </div>
+        <div className="space-y-6">
+          {/* Quick Form: Tambah Siswa ke Daftar Suspend */}
+          <section className="rounded-2xl border border-rose-200 bg-gradient-to-br from-rose-50/70 via-white to-amber-50/40 p-5 shadow-xs">
+            <div className="flex flex-col gap-1 border-b border-rose-100 pb-3.5">
+              <span className="inline-flex items-center gap-1.5 text-xs font-extrabold text-rose-700 uppercase">
+                <Ban className="h-3.5 w-3.5" />
+                Tambah Siswa ke Daftar Suspend (Blokir Pemakaian Saat di-Scan)
+              </span>
+              <p className="text-xs text-slate-600">
+                Pilih siswa yang ingin di-suspend beserta batas tanggal dan alasannya. Saat siswa tersebut melakukan scan kartu di pos peminjaman, sistem akan otomatis menolak dan menampilkan status suspend.
+              </p>
+            </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-extrabold text-slate-600 uppercase">
-                  <th className="px-4 py-3">Kode &amp; Nama Siswa</th>
-                  <th className="px-4 py-3">Kelas &amp; Wilayah</th>
-                  <th className="px-4 py-3">Riwayat Telat</th>
-                  <th className="px-4 py-3">Status Suspend &amp; Batas Waktu</th>
-                  <th className="px-4 py-3 text-right">Tindakan Admin</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {filteredStudentsForSuspend.map((s) => {
-                  const isSuspended = isStudentCurrentlySuspended(s);
-                  return (
-                    <tr key={s.id} className="hover:bg-slate-50/80">
-                      <td className="px-4 py-3">
-                        <p className="font-extrabold text-slate-900">{s.name}</p>
-                        <p className="font-mono text-[11px] font-bold text-indigo-700">
-                          {s.student_code}
-                        </p>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className="font-semibold text-slate-700">{s.class}</span> ·{' '}
-                        <span
-                          className={`font-bold ${
-                            s.wilayah === 'putra' ? 'text-sky-700' : 'text-fuchsia-700'
-                          }`}
-                        >
-                          {WILAYAH_LABELS[s.wilayah]}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 font-mono font-bold">
-                        {s.late_count}/{MAX_LATE_STRIKES}× Terlambat
-                      </td>
-                      <td className="px-4 py-3">
-                        {isSuspended ? (
-                          <div>
-                            <span className="inline-flex items-center gap-1 rounded-md bg-rose-100 px-2 py-0.5 text-[11px] font-extrabold text-rose-800">
-                              SUSPEND s/d{' '}
-                              {s.suspended_until ? formatDateOnly(s.suspended_until) : 'Admin'}
-                            </span>
-                            {s.suspended_reason && (
-                              <p className="mt-0.5 text-[11px] text-slate-500">
-                                {s.suspended_reason}
-                              </p>
-                            )}
-                          </div>
-                        ) : (
-                          <span className="font-bold text-emerald-700">Aktif (Bebas Pinjam)</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <div className="inline-flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setSuspendModalStudent(s)}
-                            className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs font-bold text-rose-700 hover:bg-rose-100"
-                          >
-                            <Ban className="h-3.5 w-3.5" />
-                            {isSuspended ? 'Ubah Waktu Suspend' : 'Suspend Siswa'}
-                          </button>
-                          {(isSuspended || s.late_count > 0) && (
-                            <button
-                              type="button"
-                              onClick={() => onResetSanction(s.id)}
-                              className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-bold text-emerald-700 hover:bg-emerald-100"
-                            >
-                              <Unlock className="h-3.5 w-3.5" />
-                              Cabut / Reset
-                            </button>
-                          )}
-                        </div>
+            <form
+              onSubmit={handleQuickSuspendSubmit}
+              className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-12 sm:items-end"
+            >
+              <div className="sm:col-span-4">
+                <label className="mb-1 block text-xs font-bold text-slate-700">
+                  Pilih Siswa untuk di-Suspend
+                </label>
+                <select
+                  required
+                  value={quickSuspendStudentId}
+                  onChange={(e) => setQuickSuspendStudentId(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-900 outline-none focus:border-rose-600"
+                >
+                  <option value="">-- Pilih Nama / Kode Siswa --</option>
+                  {students
+                    .filter((s) => (wilayahFilter === 'ALL' ? true : s.wilayah === wilayahFilter))
+                    .map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.student_code} — {s.name} ({s.class} · {WILAYAH_LABELS[s.wilayah]})
+                        {isStudentCurrentlySuspended(s) ? ' [SEDANG SUSPEND]' : ''}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              <div className="sm:col-span-3">
+                <label className="mb-1 block text-xs font-bold text-slate-700">
+                  Suspend Sampai Tanggal
+                </label>
+                <input
+                  required
+                  type="date"
+                  value={quickSuspendUntil}
+                  onChange={(e) => setQuickSuspendUntil(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-xs font-bold text-slate-900 outline-none focus:border-rose-600"
+                />
+              </div>
+
+              <div className="sm:col-span-3">
+                <label className="mb-1 block text-xs font-bold text-slate-700">
+                  Alasan / Keterangan Suspend
+                </label>
+                <input
+                  required
+                  type="text"
+                  value={quickSuspendReason}
+                  onChange={(e) => setQuickSuspendReason(e.target.value)}
+                  placeholder="Tulis alasan sanksi..."
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-900 outline-none focus:border-rose-600"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <button
+                  type="submit"
+                  disabled={quickSuspendBusy || !quickSuspendStudentId}
+                  className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-red-700 px-3.5 py-2.5 text-xs font-extrabold text-white shadow-xs hover:from-rose-700 hover:to-red-800 disabled:opacity-50"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  {quickSuspendBusy ? 'Menyimpan...' : 'Suspend Siswa'}
+                </button>
+              </div>
+            </form>
+          </section>
+
+          {/* Daftar Siswa di-Suspend & Kontrol Edit / Hapus / Cabut */}
+          <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
+            <div className="flex flex-col gap-3 border-b border-slate-200 bg-slate-50/70 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h3 className="text-sm font-extrabold text-slate-900">
+                  Daftar Siswa di-Suspend, Jadwal Bimbel &amp; Kontrol Sanksi ({filteredStudentsForSuspend.length})
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Kelola status suspend, edit jadwal hari bimbel siswa, ubah durasi suspend, atau cabut/hapus sanksi.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(
+                  [
+                    { id: 'all', label: `Semua Siswa (${students.length})` },
+                    {
+                      id: 'suspended',
+                      label: `Sedang di-Suspend (${suspendedStudentsCount})`,
+                    },
+                    {
+                      id: 'late',
+                      label: `Pernah Terlambat / Sanksi`,
+                    },
+                  ] as const
+                ).map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setSuspendListFilter(tab.id)}
+                    className={`rounded-xl px-3 py-1.5 text-xs font-extrabold transition-colors ${
+                      suspendListFilter === tab.id
+                        ? 'bg-rose-700 text-white shadow-2xs'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-extrabold text-slate-600 uppercase">
+                    <th className="px-4 py-3">Kode &amp; Nama Siswa</th>
+                    <th className="px-4 py-3">Kelas &amp; Wilayah</th>
+                    <th className="px-4 py-3">Jadwal Bimbel Siswa</th>
+                    <th className="px-4 py-3">Riwayat Telat</th>
+                    <th className="px-4 py-3">Status Suspend &amp; Batas Waktu</th>
+                    <th className="px-4 py-3 text-right">Edit, Suspend &amp; Hapus</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredStudentsForSuspend.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="px-4 py-10 text-center text-slate-400">
+                        Tidak ada data siswa yang cocok dengan filter status suspend ini.
                       </td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  ) : (
+                    filteredStudentsForSuspend.map((s) => {
+                      const isSuspended = isStudentCurrentlySuspended(s);
+                      return (
+                        <tr
+                          key={s.id}
+                          className={
+                            isSuspended ? 'bg-rose-50/40 hover:bg-rose-50/70' : 'hover:bg-slate-50/80'
+                          }
+                        >
+                          <td className="px-4 py-3">
+                            <p className="font-extrabold text-slate-900">{s.name}</p>
+                            <p className="font-mono text-[11px] font-bold text-indigo-700">
+                              {s.student_code}
+                            </p>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className="font-semibold text-slate-700">{s.class}</span> ·{' '}
+                            <span
+                              className={`font-bold ${
+                                s.wilayah === 'putra' ? 'text-sky-700' : 'text-fuchsia-700'
+                              }`}
+                            >
+                              {WILAYAH_LABELS[s.wilayah]}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className="inline-flex items-center rounded-md bg-indigo-50 px-2 py-0.5 text-[11px] font-bold text-indigo-800">
+                              {formatBimbelDays(s.bimbel_days)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 font-mono font-bold">
+                            {s.late_count}/{MAX_LATE_STRIKES}× Terlambat
+                          </td>
+                          <td className="px-4 py-3">
+                            {isSuspended ? (
+                              <div>
+                                <span className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2 py-0.5 text-[11px] font-extrabold text-white">
+                                  <Ban className="h-3 w-3" />
+                                  DI-SUSPEND s/d{' '}
+                                  {s.suspended_until ? formatDateOnly(s.suspended_until) : 'Admin'}
+                                </span>
+                                {s.suspended_reason && (
+                                  <p className="mt-0.5 text-[11px] font-semibold text-rose-800">
+                                    Alasan: {s.suspended_reason}
+                                  </p>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="font-bold text-emerald-700">
+                                Aktif (Diizinkan Scan)
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
+                              {onUpdateStudent && (
+                                <button
+                                  type="button"
+                                  onClick={() => openEditStudentModal(s)}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1.5 text-xs font-bold text-indigo-700 hover:bg-indigo-100"
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" />
+                                  Edit Siswa
+                                </button>
+                              )}
+
+                              <button
+                                type="button"
+                                onClick={() => setSuspendModalStudent(s)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs font-bold text-rose-700 hover:bg-rose-100"
+                              >
+                                <Ban className="h-3.5 w-3.5" />
+                                {isSuspended ? 'Edit Suspend' : 'Suspend'}
+                              </button>
+
+                              {(isSuspended || s.late_count > 0) && (
+                                <button
+                                  type="button"
+                                  onClick={() => onResetSanction(s.id)}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-bold text-emerald-700 hover:bg-emerald-100"
+                                >
+                                  <Unlock className="h-3.5 w-3.5" />
+                                  Hapus / Cabut Suspend
+                                </button>
+                              )}
+
+                              {onDeleteStudent && (
+                                <>
+                                  {confirmDeleteStudentId === s.id ? (
+                                    <div className="inline-flex items-center gap-1 rounded-lg border border-rose-300 bg-rose-100 px-2 py-1">
+                                      <button
+                                        type="button"
+                                        disabled={busyId === s.id}
+                                        onClick={() => handleConfirmDeleteStudent(s.id)}
+                                        className="text-[11px] font-extrabold text-rose-800 hover:underline"
+                                      >
+                                        Ya, Hapus
+                                      </button>
+                                      <span className="text-rose-300">|</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteStudentId(null)}
+                                        className="text-[11px] font-bold text-slate-600 hover:underline"
+                                      >
+                                        Batal
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteStudentId(s.id)}
+                                      title="Hapus data siswa"
+                                      className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-400 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* Modal Edit Siswa & Jadwal Bimbel */}
+      {editingStudent && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-lg overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 bg-slate-900 px-5 py-4 text-white">
+              <div>
+                <p className="text-[11px] font-extrabold tracking-wider text-amber-300 uppercase">
+                  Edit Data &amp; Jadwal Bimbel Siswa
+                </p>
+                <h3 className="text-base font-extrabold">
+                  {editingStudent.name} ({editingStudent.student_code})
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingStudent(null)}
+                className="rounded-lg p-1 text-slate-300 hover:bg-white/10 hover:text-white"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditedStudent} className="space-y-4 p-5">
+              <div>
+                <label className="mb-1 block text-xs font-bold text-slate-700">
+                  Nama Lengkap Siswa
+                </label>
+                <input
+                  required
+                  type="text"
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-600"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-xs font-bold text-slate-700">Kelas</label>
+                  <input
+                    required
+                    type="text"
+                    value={editClass}
+                    onChange={(e) => setEditClass(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-600"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-bold text-slate-700">Wilayah</label>
+                  <select
+                    value={editWilayah}
+                    onChange={(e) => setEditWilayah(e.target.value as Wilayah)}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-600"
+                  >
+                    <option value="putra">Wilayah Putra</option>
+                    <option value="putri">Wilayah Putri</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-slate-700">
+                    Jadwal Hari Bimbel / Penggunaan Laptop
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setEditBimbelDays([])}
+                    className="text-[11px] font-bold text-indigo-700 hover:underline"
+                  >
+                    Set Semua Hari (Bebas)
+                  </button>
+                </div>
+                <p className="mt-0.5 text-[11px] text-slate-500">
+                  Jika hari tertentu dipilih, sistem otomatis menolak saat siswa scan di luar hari jadwal bimbel tersebut.
+                </p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {BIMBEL_DAY_OPTIONS.map((day) => {
+                    const active = editBimbelDays.includes(day);
+                    return (
+                      <button
+                        key={day}
+                        type="button"
+                        onClick={() => toggleEditBimbelDay(day)}
+                        className={`rounded-lg px-2.5 py-1.5 text-xs font-extrabold transition-colors ${
+                          active
+                            ? 'bg-indigo-700 text-white shadow-2xs'
+                            : 'border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {day}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="mt-1.5 text-[11px] font-bold text-indigo-800">
+                  Jadwal Aktif: {formatBimbelDays(editBimbelDays)}
+                </p>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setEditingStudent(null)}
+                  className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={editStudentBusy}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-700 px-4 py-2 text-xs font-extrabold text-white hover:bg-indigo-800 disabled:opacity-50"
+                >
+                  <Save className="h-3.5 w-3.5" />
+                  {editStudentBusy ? 'Menyimpan...' : 'Simpan Perubahan'}
+                </button>
+              </div>
+            </form>
           </div>
-        </section>
+        </div>
       )}
 
       {suspendModalStudent && (

@@ -30,7 +30,9 @@ import {
   extractPrefixAndNumber,
   findStudentByScannedCode,
   normalizeCodeCompact,
+  parseBimbelDays,
   validateDailySessionSelection,
+  validateStudentBimbelSchedule,
 } from './src/lib/store';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -1118,22 +1120,24 @@ async function startServer() {
         const nowMs = Date.now();
         const incomingTxs = bundle.transactions.slice(0, 2000);
         const incomingIds = new Set(incomingTxs.map((t: Transaction) => t.id));
-        const recentServerOnly = db.transactions.filter((t) => {
-          if (incomingIds.has(t.id)) return false;
-          const bMs = new Date(t.borrow_time).getTime();
-          return !Number.isNaN(bMs) && nowMs - bMs < 15000;
-        });
+        const recentServerOnly =
+          serverTime > incomingTime
+            ? db.transactions.filter((t) => {
+                if (incomingIds.has(t.id)) return false;
+                const bMs = new Date(t.borrow_time).getTime();
+                return !Number.isNaN(bMs) && nowMs - bMs < 15000;
+              })
+            : [];
         db.transactions = [...recentServerOnly, ...incomingTxs];
-        if (recentServerOnly.length > 0) {
-          const activeLaptopIds = new Set(
-            db.transactions
-              .filter((t) => t.status === 'active')
-              .map((t) => t.laptop_id)
-          );
-          db.laptops = db.laptops.map((l) =>
-            activeLaptopIds.has(l.id) ? { ...l, status: 'borrowed' } : l
-          );
-        }
+        const activeLaptopIds = new Set(
+          db.transactions
+            .filter((t) => t.status === 'active')
+            .map((t) => t.laptop_id)
+        );
+        db.laptops = db.laptops.map((l) => ({
+          ...l,
+          status: activeLaptopIds.has(l.id) ? 'borrowed' : 'available',
+        }));
       }
       if (Array.isArray(bundle.schedules)) {
         db.schedules = bundle.schedules.slice(0, 200);
@@ -1180,7 +1184,7 @@ async function startServer() {
   // Persists activePage, wizardStep, piketTicket, selectedSessionKey, scanMode across browser refreshes
   app.patch('/api/kiosk-state', (req, res) => {
     const patch = req.body || {};
-    const validPages: ActivePage[] = ['scan', 'database', 'manajemen', 'print'];
+    const validPages: ActivePage[] = ['scan', 'database', 'suspend', 'manajemen', 'print'];
     const validSteps: KioskWizardStep[] = [
       'piket_login',
       'select_session',
@@ -1452,7 +1456,19 @@ async function startServer() {
       return;
     }
 
-    // 4. Daily Session check for Penggunaan Harian (Siang / Sore / Malam / Kegiatan Lainnya)
+    // 4. Jadwal Hari Bimbel / Penggunaan Siswa check
+    if (transactionType === 'harian') {
+      const bimbelCheck = validateStudentBimbelSchedule(student, new Date());
+      if (!bimbelCheck.allowedToday) {
+        res.status(403).json({
+          code: 'OUT_OF_BIMBEL_SCHEDULE',
+          error: bimbelCheck.reason,
+        });
+        return;
+      }
+    }
+
+    // 5. Daily Session check for Penggunaan Harian (Siang / Sore / Malam / Kegiatan Lainnya)
     // Kepulangan ('pulang') waktunya bebas 24 jam tanpa penahanan jam sesi
     const isKegiatanLainnya = dailySessionKey === 'kegiatan_lainnya';
     const sessionConfig = isKegiatanLainnya
@@ -1624,6 +1640,67 @@ async function startServer() {
   });
 
   // ==========================================
+  // ADMIN-ONLY TRANSACTION RECAP DELETION / CLEAR
+  // ==========================================
+  app.delete('/api/transactions/:id', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const txId = req.params.id;
+    const target = db.transactions.find((t) => t.id === txId);
+    if (!target) {
+      res.status(404).json({ error: 'Data rekapitulasi transaksi tidak ditemukan.' });
+      return;
+    }
+    db.transactions = db.transactions.filter((t) => t.id !== txId);
+    if (target.status === 'active') {
+      const stillActiveForLaptop = db.transactions.some(
+        (t) => t.status === 'active' && t.laptop_id === target.laptop_id
+      );
+      if (!stillActiveForLaptop) {
+        db.laptops = db.laptops.map((l) =>
+          l.id === target.laptop_id ? { ...l, status: 'available' } : l
+        );
+      }
+    }
+    res.json({
+      deletedCount: 1,
+      state: buildStateForRole('admin'),
+    });
+  });
+
+  app.post('/api/transactions/clear', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const mode = req.body?.mode;
+    const txIds = Array.isArray(req.body?.txIds) ? req.body.txIds : [];
+    const beforeCount = db.transactions.length;
+
+    if (mode === 'all') {
+      db.transactions = [];
+      db.laptops = db.laptops.map((l) => ({ ...l, status: 'available' }));
+    } else if (mode === 'returned') {
+      db.transactions = db.transactions.filter((t) => t.status === 'active');
+    } else if (mode === 'selected') {
+      const idSet = new Set(txIds);
+      db.transactions = db.transactions.filter((t) => !idSet.has(t.id));
+      const activeLaptopIds = new Set(
+        db.transactions
+          .filter((t) => t.status === 'active')
+          .map((t) => t.laptop_id)
+      );
+      db.laptops = db.laptops.map((l) => ({
+        ...l,
+        status: activeLaptopIds.has(l.id) ? 'borrowed' : 'available',
+      }));
+    } else {
+      res.status(400).json({ error: 'Mode pengosongan rekapitulasi tidak valid.' });
+      return;
+    }
+
+    const deletedCount = Math.max(0, beforeCount - db.transactions.length);
+    res.json({
+      deletedCount,
+      state: buildStateForRole('admin'),
+    });
+  });
+
+  // ==========================================
   // ADMIN-ONLY DATA MASTER (FULL CRUD + CSV BULK UPLOAD)
   // ==========================================
   app.post('/api/students', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
@@ -1631,6 +1708,7 @@ async function startServer() {
     const studentClass = typeof req.body?.class === 'string' ? req.body.class.trim() : '';
     const wilayah = normalizeWilayah(req.body?.wilayah, 'putra');
     const photoUrl = sanitizePhotoUrl(req.body?.photo_url);
+    const bimbelDays = parseBimbelDays(req.body?.bimbel_days);
 
     if (!name || !studentClass) {
       res.status(400).json({ error: 'Nama dan kelas siswa wajib diisi.' });
@@ -1644,6 +1722,7 @@ async function startServer() {
       class: studentClass.slice(0, 40),
       wilayah,
       photo_url: photoUrl,
+      bimbel_days: bimbelDays,
       late_count: 0,
       is_suspended: false,
       suspended_until: null,
@@ -1681,6 +1760,9 @@ async function startServer() {
     student.class = studentClass.slice(0, 40);
     student.wilayah = wilayah;
     student.photo_url = photoUrl;
+    if (req.body?.bimbel_days !== undefined) {
+      student.bimbel_days = parseBimbelDays(req.body.bimbel_days);
+    }
 
     res.json({ student, state: buildStateForRole('admin') });
   });
@@ -1707,6 +1789,7 @@ async function startServer() {
       const laptopBrand =
         typeof raw?.laptop_brand === 'string' ? raw.laptop_brand.trim() : '';
       const photoUrl = sanitizePhotoUrl(raw?.photo_url);
+      const parsedBimbel = parseBimbelDays(raw?.bimbel_days);
 
       if (!name) continue;
 
@@ -1723,6 +1806,9 @@ async function startServer() {
         student.wilayah = wilayah;
         if (customCode) student.student_code = customCode.slice(0, 40);
         if (photoUrl) student.photo_url = photoUrl;
+        if (raw?.bimbel_days !== undefined) {
+          student.bimbel_days = parsedBimbel;
+        }
         createdStudents++;
       } else {
         student = {
@@ -1732,6 +1818,7 @@ async function startServer() {
           class: cls.slice(0, 40),
           wilayah,
           photo_url: photoUrl,
+          bimbel_days: parsedBimbel,
           late_count: 0,
           is_suspended: false,
           suspended_until: null,

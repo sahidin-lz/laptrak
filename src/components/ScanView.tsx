@@ -41,6 +41,7 @@ import { api, ApiError, BorrowPayload } from '../lib/api';
 import {
   findLaptopBagStrict,
   findStudentCardStrict,
+  formatBimbelDays,
   formatDateOnly,
   formatTimeOnly,
   getCurrentSuggestedSessionKey,
@@ -48,6 +49,7 @@ import {
   isStudentCurrentlySuspended,
   normalizeCodeCompact,
   validateDailySessionSelection,
+  validateStudentBimbelSchedule,
 } from '../lib/store';
 import { playFeedback } from '../lib/sound';
 import { QrScannerBox } from './QrScannerBox';
@@ -580,6 +582,29 @@ export function ScanView({
         return;
       }
 
+      // If student is borrowing in Harian mode, verify that today matches their Jadwal Bimbel
+      if (laptopJatah.status === 'available' && scanMode === 'harian') {
+        const bimbelCheck = validateStudentBimbelSchedule(student, now);
+        if (!bimbelCheck.allowedToday) {
+          playFeedback('error');
+          setValidationResult({
+            status: 'error',
+            headline: 'JADWAL BIMBEL / PENGGUNAAN TIDAK SESUAI HARI INI',
+            subheadline: bimbelCheck.reason,
+            student,
+            laptop: laptopJatah,
+            sessionLabel: currentSessionTitle,
+            customActivityText: customActivityInput.trim() || null,
+            deadlineLabel: `Jadwal: ${bimbelCheck.scheduleLabel}`,
+            piketName: piketTicket.name,
+            ticketNumber: piketTicket.ticket_number,
+            timestamp: nowTimeStr,
+          });
+          setWizardStep('validation_panel');
+          return;
+        }
+      }
+
       // Valid student card! Record timestamp to debounce leftover camera frames & advance to Phase 2 (scan_bag)
       lastVerifiedCardRef.current = {
         rawCode: cleanCode,
@@ -748,6 +773,8 @@ export function ScanView({
               headline:
                 res.code === 'SUSPENDED_3X_LATE'
                   ? 'SISWA SEDANG DI-SUSPEND'
+                  : res.code === 'OUT_OF_BIMBEL_SCHEDULE'
+                  ? 'JADWAL BIMBEL / PENGGUNAAN TIDAK SESUAI HARI INI'
                   : res.code === 'OUT_OF_SCHEDULE'
                   ? 'SESI TIDAK SESUAI JAM — DIKOREKSI OTOMATIS'
                   : 'PEMINJAMAN DITOLAK',
@@ -1643,6 +1670,9 @@ export function ScanView({
                       <p className="text-xs font-semibold text-slate-600">
                         Kelas {scannedStudent.class} ·{' '}
                         {WILAYAH_LABELS[scannedStudent.wilayah]}
+                      </p>
+                      <p className="mt-1 inline-flex items-center gap-1 rounded-md bg-indigo-100 px-2 py-0.5 text-[11px] font-extrabold text-indigo-800">
+                        Jadwal Bimbel: {formatBimbelDays(scannedStudent.bimbel_days)}
                       </p>
                     </div>
                   </div>

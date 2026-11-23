@@ -12,6 +12,7 @@ import {
   RefreshCw,
   RotateCcw,
   ScanLine,
+  ShieldAlert,
   ShieldCheck,
   Zap,
 } from 'lucide-react';
@@ -74,16 +75,23 @@ const ADMIN_NAV_ITEMS: NavConfig[] = [
   },
   {
     id: 'database',
-    label: 'Database & Tracking',
-    shortLabel: 'Database',
-    breadcrumb: 'Data Pemakaian Lengkap & Tracking Semua Unit Laptop',
+    label: 'Database & Laporan PDF',
+    shortLabel: 'Laporan',
+    breadcrumb: 'Laporan Harian/Bulanan/Tahunan, Unduh PDF, Hapus Rekap & Tracking Laptop',
     icon: Database,
+  },
+  {
+    id: 'suspend',
+    label: 'Siswa di Suspend',
+    shortLabel: 'Suspend',
+    breadcrumb: 'Menu Khusus Admin: Daftar Siswa di-Suspend, Tambah, Edit & Cabut Sanksi',
+    icon: ShieldAlert,
   },
   {
     id: 'manajemen',
     label: 'Manajemen Data & CSV',
     shortLabel: 'Manajemen',
-    breadcrumb: 'CRUD Siswa, Laptop, Pegawai (Token Barcode) & Upload CSV',
+    breadcrumb: 'CRUD Siswa (Jadwal Bimbel), Laptop, Pegawai (Token Barcode) & Upload CSV',
     icon: FileSpreadsheet,
   },
   {
@@ -466,11 +474,27 @@ export default function App() {
     applyAndSyncState(res.state, 1800);
   };
 
+  const handleDeleteTransaction = async (txId: string) => {
+    const res = await api.deleteTransaction(txId);
+    setState(res.state);
+    await flushStateToFirestoreNow(res.state);
+  };
+
+  const handleClearTransactions = async (payload: {
+    mode: 'all' | 'returned' | 'selected';
+    txIds?: string[];
+  }) => {
+    const res = await api.clearTransactions(payload);
+    setState(res.state);
+    await flushStateToFirestoreNow(res.state);
+  };
+
   const handleAddStudent = async (payload: {
     name: string;
     class: string;
     wilayah: Wilayah;
     photo_url: string | null;
+    bimbel_days?: string[];
   }) => {
     try {
       const res = await api.addStudent(payload);
@@ -488,6 +512,7 @@ export default function App() {
       class: string;
       wilayah: Wilayah;
       photo_url?: string | null;
+      bimbel_days?: string[];
     }
   ) => {
     try {
@@ -786,7 +811,7 @@ export default function App() {
                         {activeBorrowedCount}
                       </span>
                     )}
-                    {item.id === 'manajemen' && suspendedCount > 0 && (
+                    {item.id === 'suspend' && suspendedCount > 0 && (
                       <span
                         className={`rounded-md px-1.5 py-0.5 font-mono text-[11px] font-extrabold tabular-nums ${
                           isActive ? 'bg-white/20 text-white' : 'bg-rose-100 text-rose-800'
@@ -1015,15 +1040,23 @@ export default function App() {
             />
           )}
 
-          {activePage === 'database' && isAdmin && (
+          {(activePage === 'database' || activePage === 'suspend') && isAdmin && (
             <MonitoringView
               students={state.students}
               laptops={state.laptops}
               dailySessions={state.dailySessions}
               transactions={state.transactions}
+              printSettings={state.printSettings}
+              initialSectionTab={
+                activePage === 'suspend' ? 'suspend_siswa' : 'pemakaian_lengkap'
+              }
               onManualReturn={handleManualReturn}
               onSuspendStudent={handleSuspendStudent}
               onResetSanction={handleResetSanction}
+              onDeleteTransaction={handleDeleteTransaction}
+              onClearTransactions={handleClearTransactions}
+              onUpdateStudent={handleUpdateStudent}
+              onDeleteStudent={handleDeleteStudent}
             />
           )}
 

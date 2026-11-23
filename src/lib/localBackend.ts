@@ -27,7 +27,9 @@ import {
   extractPrefixAndNumber,
   findStudentByScannedCode,
   normalizeCodeCompact,
+  parseBimbelDays,
   validateDailySessionSelection,
+  validateStudentBimbelSchedule,
 } from './store';
 
 const LOCAL_DB_KEY = 'laptrack_serverless_db_v1';
@@ -916,7 +918,7 @@ export const localBackend = {
   updateKioskState: async (
     patch: Partial<KioskPersistedState>
   ): Promise<{ kioskState: KioskPersistedState }> => {
-    const validPages: ActivePage[] = ['scan', 'database', 'manajemen', 'print'];
+    const validPages: ActivePage[] = ['scan', 'database', 'suspend', 'manajemen', 'print'];
     const validSteps: KioskWizardStep[] = [
       'piket_login',
       'select_session',
@@ -1127,6 +1129,13 @@ export const localBackend = {
         }
       : localDb.dailySessions.find((s) => s.key === dailySessionKey) || localDb.dailySessions[1];
 
+    if (payload.transactionType === 'harian') {
+      const bimbelValidation = validateStudentBimbelSchedule(student, new Date());
+      if (!bimbelValidation.allowedToday) {
+        throw new ApiError(bimbelValidation.reason, 403, 'OUT_OF_BIMBEL_SCHEDULE');
+      }
+    }
+
     if (payload.transactionType === 'harian' && !isKegiatanLainnya) {
       const timeValidation = validateDailySessionSelection(
         dailySessionKey,
@@ -1271,11 +1280,53 @@ export const localBackend = {
     };
   },
 
+  deleteTransaction: async (transactionId: string) => {
+    const target = localDb.transactions.find((t) => t.id === transactionId);
+    if (!target) {
+      throw new ApiError('Data transaksi rekapitulasi tidak ditemukan.', 404);
+    }
+    if (target.status === 'active') {
+      const lap = localDb.laptops.find((l) => l.id === target.laptop_id);
+      if (lap) lap.status = 'available';
+    }
+    localDb.transactions = localDb.transactions.filter((t) => t.id !== transactionId);
+    return { deletedCount: 1, state: buildAppState() };
+  },
+
+  clearTransactions: async (payload: {
+    mode: 'all' | 'returned' | 'selected';
+    txIds?: string[];
+  }) => {
+    const beforeCount = localDb.transactions.length;
+    if (payload.mode === 'all') {
+      localDb.transactions = [];
+      localDb.laptops = localDb.laptops.map((l) => ({ ...l, status: 'available' }));
+    } else if (payload.mode === 'returned') {
+      localDb.transactions = localDb.transactions.filter((t) => t.status === 'active');
+    } else if (payload.mode === 'selected' && Array.isArray(payload.txIds)) {
+      const idSet = new Set(payload.txIds);
+      const removedActiveLaptopIds = new Set(
+        localDb.transactions
+          .filter((t) => idSet.has(t.id) && t.status === 'active')
+          .map((t) => t.laptop_id)
+      );
+      localDb.transactions = localDb.transactions.filter((t) => !idSet.has(t.id));
+      if (removedActiveLaptopIds.size > 0) {
+        localDb.laptops = localDb.laptops.map((l) =>
+          removedActiveLaptopIds.has(l.id) ? { ...l, status: 'available' } : l
+        );
+      }
+    }
+    const deletedCount = Math.max(0, beforeCount - localDb.transactions.length);
+    return { deletedCount, state: buildAppState() };
+  },
+
   addStudent: async (payload: {
     name: string;
     class: string;
     wilayah: Wilayah;
     photo_url: string | null;
+    bimbel_days?: string[];
   }) => {
     const created: Student = {
       id: makeId('stu'),
@@ -1284,6 +1335,7 @@ export const localBackend = {
       class: payload.class.trim(),
       wilayah: normalizeWilayah(payload.wilayah, 'putra'),
       photo_url: payload.photo_url,
+      bimbel_days: parseBimbelDays(payload.bimbel_days),
       late_count: 0,
       is_suspended: false,
       suspended_until: null,
@@ -1305,6 +1357,7 @@ export const localBackend = {
       class: string;
       wilayah: Wilayah;
       photo_url?: string | null;
+      bimbel_days?: string[];
     }
   ) => {
     const student = localDb.students.find((s) => s.id === studentId);
@@ -1314,6 +1367,9 @@ export const localBackend = {
     student.wilayah = normalizeWilayah(payload.wilayah, student.wilayah);
     if (payload.photo_url !== undefined) {
       student.photo_url = payload.photo_url;
+    }
+    if (payload.bimbel_days !== undefined) {
+      student.bimbel_days = parseBimbelDays(payload.bimbel_days);
     }
     return { state: buildAppState() };
   },
@@ -1326,6 +1382,7 @@ export const localBackend = {
       wilayah?: Wilayah;
       laptop_code?: string;
       laptop_brand?: string;
+      bimbel_days?: string[];
       photo_url?: string | null;
     }>
   ) => {
@@ -1339,6 +1396,7 @@ export const localBackend = {
       const cleanClass = (raw.class || '10').trim();
       const cleanWilayah = normalizeWilayah(raw.wilayah, 'putra');
       const customCode = raw.student_code?.trim().toUpperCase();
+      const parsedBimbel = parseBimbelDays(raw.bimbel_days);
 
       // Check if student already exists by student_code or exact name
       let student = localDb.students.find(
@@ -1354,6 +1412,7 @@ export const localBackend = {
         student.wilayah = cleanWilayah;
         if (customCode) student.student_code = customCode;
         if (raw.photo_url) student.photo_url = raw.photo_url;
+        if (raw.bimbel_days !== undefined) student.bimbel_days = parsedBimbel;
         createdStudents++;
       } else {
         const nextCode = customCode || formatStudentCode(localDb.studentSeq++);
@@ -1364,6 +1423,7 @@ export const localBackend = {
           class: cleanClass,
           wilayah: cleanWilayah,
           photo_url: raw.photo_url || null,
+          bimbel_days: parsedBimbel,
           late_count: 0,
           is_suspended: false,
           suspended_until: null,

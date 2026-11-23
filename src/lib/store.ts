@@ -202,6 +202,98 @@ export function validateDailySessionSelection(
   };
 }
 
+export const BIMBEL_DAY_OPTIONS = [
+  'Senin',
+  'Selasa',
+  'Rabu',
+  'Kamis',
+  'Jumat',
+  'Sabtu',
+  'Minggu',
+] as const;
+
+export function parseBimbelDays(raw: unknown): string[] {
+  if (!raw) return [];
+  const rawList: string[] = Array.isArray(raw)
+    ? raw.map((x) => String(x || ''))
+    : String(raw)
+        .split(/[,;/|+&]+|\s+dan\s+|\s+/i)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+  const normalized: string[] = [];
+  for (const item of rawList) {
+    const lower = item.trim().toLowerCase();
+    if (!lower || lower === 'semua' || lower === 'bebas' || lower === 'all' || lower === '-') {
+      if (lower === 'semua' || lower === 'bebas' || lower === 'all') {
+        return [];
+      }
+      continue;
+    }
+    let matched: string | null = null;
+    if (lower.startsWith('sen')) matched = 'Senin';
+    else if (lower.startsWith('sel')) matched = 'Selasa';
+    else if (lower.startsWith('rab')) matched = 'Rabu';
+    else if (lower.startsWith('kam')) matched = 'Kamis';
+    else if (lower.startsWith('jum')) matched = 'Jumat';
+    else if (lower.startsWith('sab')) matched = 'Sabtu';
+    else if (lower.startsWith('min') || lower.startsWith('ahad')) matched = 'Minggu';
+
+    if (matched && !normalized.includes(matched)) {
+      normalized.push(matched);
+    }
+  }
+  return normalized;
+}
+
+export function formatBimbelDays(days?: string[] | null): string {
+  if (!days || days.length === 0) return 'Semua Hari (Bebas)';
+  return days.join(', ');
+}
+
+/**
+ * Validates whether today's day matches the student's configured `bimbel_days` schedule.
+ * If `student.bimbel_days` is empty or undefined, all days are allowed.
+ */
+export function validateStudentBimbelSchedule(
+  student: Student,
+  now = new Date()
+): {
+  hasSchedule: boolean;
+  todayName: string;
+  allowedToday: boolean;
+  scheduleLabel: string;
+  reason: string;
+} {
+  const todayName = DAYS_ID[now.getDay()];
+  const configuredDays = parseBimbelDays(student.bimbel_days);
+  if (configuredDays.length === 0) {
+    return {
+      hasSchedule: false,
+      todayName,
+      allowedToday: true,
+      scheduleLabel: 'Semua Hari (Bebas)',
+      reason: '',
+    };
+  }
+
+  const allowedToday = configuredDays.some(
+    (d) => d.toLowerCase() === todayName.toLowerCase()
+  );
+  const scheduleLabel = configuredDays.join(', ');
+  const reason = allowedToday
+    ? ''
+    : `Jadwal Bimbel / Penggunaan ${student.name} terdaftar pada hari [${scheduleLabel}], sedangkan hari ini adalah hari ${todayName}. Sistem mendeteksi ketidaksesuaian jadwal penggunaan hari ini.`;
+
+  return {
+    hasSchedule: true,
+    todayName,
+    allowedToday,
+    scheduleLabel,
+    reason,
+  };
+}
+
 export interface ParsedStudentLaptopRow {
   student_code?: string;
   name: string;
@@ -209,6 +301,7 @@ export interface ParsedStudentLaptopRow {
   wilayah: Wilayah;
   laptop_code?: string;
   laptop_brand?: string;
+  bimbel_days?: string[];
   photo_url?: string | null;
 }
 
@@ -391,22 +484,23 @@ function parseStaffWilayahCol(raw: string | undefined): StaffWilayah {
 
 /**
  * Header-aware & fallback parser for Student + Laptop CSV/Excel template.
- * Supports optional `no`, `kode_siswa`, and any column ordering:
- * e.g. nama | kelas | wilayah | kode_laptop | merk_laptop | photo_url
- * or kode_siswa | nama | kelas | wilayah | kode_laptop | merk_laptop
+ * Supports optional `no`, `kode_siswa`, `jadwal_bimbel`, and any column ordering:
+ * e.g. nama | kelas | wilayah | kode_laptop | merk_laptop | jadwal_bimbel | photo_url
  */
 export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
   const lines = normalizeCsvLines(text);
   if (lines.length === 0) return [];
 
   const firstRowCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase().trim());
-  const isHeaderRow = firstRowCols.some((c) =>
-    /^(no|nomor|nama|name|siswa|murid|kelas|class|wilayah|kode_siswa|student_code|nis|kode_laptop|asset_code|merk_laptop)$/.test(
-      c.replace(/\s+/g, '_')
-    ) ||
-    c.includes('nama') ||
-    c.includes('kelas') ||
-    c.includes('laptop')
+  const isHeaderRow = firstRowCols.some(
+    (c) =>
+      /^(no|nomor|nama|name|siswa|murid|kelas|class|wilayah|kode_siswa|student_code|nis|kode_laptop|asset_code|merk_laptop|jadwal_bimbel|hari_bimbel|bimbel)$/.test(
+        c.replace(/\s+/g, '_')
+      ) ||
+      c.includes('nama') ||
+      c.includes('kelas') ||
+      c.includes('laptop') ||
+      c.includes('bimbel')
   );
 
   const dataLines = isHeaderRow ? lines.slice(1) : lines;
@@ -435,6 +529,10 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
     /^(merk_laptop|merk|brand|brand_model|tipe_laptop|model_laptop)$/,
     /merk|brand/,
   ]);
+  const idxBimbel = findColIdx([
+    /^(jadwal_bimbel|hari_bimbel|jadwal_hari|bimbel|hari_penggunaan|jadwal)$/,
+    /bimbel|jadwal/,
+  ]);
   const idxPhoto = findColIdx([/^(photo_url|foto|photo|url_foto)$/]);
 
   return dataLines
@@ -452,6 +550,7 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
         const studentCodeRaw = idxStudentCode !== -1 ? (cols[idxStudentCode] || '').trim() : '';
         const kodeLaptopRaw = idxLaptopCode !== -1 ? (cols[idxLaptopCode] || '').trim() : '';
         const merkLaptopRaw = idxLaptopBrand !== -1 ? (cols[idxLaptopBrand] || '').trim() : '';
+        const bimbelRaw = idxBimbel !== -1 ? (cols[idxBimbel] || '').trim() : '';
         const fotoRaw = idxPhoto !== -1 ? (cols[idxPhoto] || '').trim() : '';
 
         return {
@@ -461,14 +560,16 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
           wilayah: parseWilayahCol(wilayahRaw),
           laptop_code: kodeLaptopRaw ? kodeLaptopRaw.toUpperCase() : undefined,
           laptop_brand: merkLaptopRaw || undefined,
+          bimbel_days: parseBimbelDays(bimbelRaw),
           photo_url: fotoRaw || null,
         };
       }
 
       // Positional fallback
-      const [c0, c1, c2, c3, c4, c5] = cols;
+      const [c0, c1, c2, c3, c4, c5, c6] = cols;
       // Check if c0 looks like a student code (SIS-XXXX)
       if (/^SIS[-_]?\d+/i.test(c0 || '') && c1) {
+        const parsedDays = parseBimbelDays(c6);
         return {
           student_code: c0.toUpperCase(),
           name: c1,
@@ -476,9 +577,13 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
           wilayah: parseWilayahCol(c3),
           laptop_code: c4 ? c4.toUpperCase() : undefined,
           laptop_brand: c5 || undefined,
+          bimbel_days: parsedDays.length > 0 ? parsedDays : undefined,
           photo_url: null,
         };
       }
+
+      const c5Days = parseBimbelDays(c5);
+      const isC5Bimbel = c5Days.length > 0 && !/^https?:|^data:/i.test(c5 || '');
 
       return {
         name: c0 || '',
@@ -486,7 +591,8 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
         wilayah: parseWilayahCol(c2),
         laptop_code: c3 ? c3.toUpperCase() : undefined,
         laptop_brand: c4 || undefined,
-        photo_url: c5 || null,
+        bimbel_days: isC5Bimbel ? c5Days : undefined,
+        photo_url: isC5Bimbel ? c6 || null : c5 || null,
       };
     })
     .filter((row) => Boolean(row.name));

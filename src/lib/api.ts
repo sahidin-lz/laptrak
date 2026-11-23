@@ -273,11 +273,34 @@ export const api = {
         )
     ),
 
+  deleteTransaction: (transactionId: string) =>
+    requestWithFallback<{ deletedCount: number; state: AppStatePayload }>(
+      `/api/transactions/${transactionId}`,
+      {
+        method: 'DELETE',
+      },
+      () => localBackend.deleteTransaction(transactionId)
+    ),
+
+  clearTransactions: (payload: {
+    mode: 'all' | 'returned' | 'selected';
+    txIds?: string[];
+  }) =>
+    requestWithFallback<{ deletedCount: number; state: AppStatePayload }>(
+      '/api/transactions/clear',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.clearTransactions(payload)
+    ),
+
   addStudent: (payload: {
     name: string;
     class: string;
     wilayah: Wilayah;
     photo_url: string | null;
+    bimbel_days?: string[];
   }) =>
     requestWithFallback<{ student: { student_code: string; name: string }; state: AppStatePayload }>(
       '/api/students',
@@ -295,6 +318,7 @@ export const api = {
       class: string;
       wilayah: Wilayah;
       photo_url?: string | null;
+      bimbel_days?: string[];
     }
   ) =>
     requestWithFallback<{ state: AppStatePayload }>(
@@ -308,11 +332,13 @@ export const api = {
 
   bulkAddStudents: (
     rows: Array<{
+      student_code?: string;
       name: string;
       class: string;
       wilayah?: Wilayah;
       laptop_code?: string;
       laptop_brand?: string;
+      bimbel_days?: string[];
       photo_url?: string | null;
     }>
   ) =>

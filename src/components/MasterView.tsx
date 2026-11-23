@@ -45,11 +45,14 @@ import {
   WILAYAH_LABELS,
 } from '../types/models';
 import {
+  BIMBEL_DAY_OPTIONS,
   downloadMultiColumnCsv,
   downloadMultiColumnExcel,
+  formatBimbelDays,
   formatDateTimeID,
   getSuggestedTargetClass,
   isStudentCurrentlySuspended,
+  parseBimbelDays,
   ParsedLaptopCsvRow,
   ParsedStaffCsvRow,
   ParsedStudentLaptopRow,
@@ -82,6 +85,7 @@ interface MasterViewProps {
     class: string;
     wilayah: Wilayah;
     photo_url: string | null;
+    bimbel_days?: string[];
   }) => Promise<{ ok: boolean; studentCode?: string; error?: string }>;
   onUpdateStudent: (
     studentId: string,
@@ -90,6 +94,7 @@ interface MasterViewProps {
       class: string;
       wilayah: Wilayah;
       photo_url?: string | null;
+      bimbel_days?: string[];
     }
   ) => Promise<{ ok: boolean; error?: string }>;
   onBulkAddStudents: (
@@ -219,6 +224,7 @@ export function MasterView({
   const [name, setName] = useState('');
   const [studentClass, setStudentClass] = useState('');
   const [studentWilayah, setStudentWilayah] = useState<Wilayah>('putra');
+  const [studentBimbelDays, setStudentBimbelDays] = useState<string[]>([]);
   const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
 
   // Laptop CRUD form state
@@ -339,6 +345,7 @@ export function MasterView({
     setName(st.name);
     setStudentClass(st.class);
     setStudentWilayah(st.wilayah);
+    setStudentBimbelDays(parseBimbelDays(st.bimbel_days));
     setPhotoDataUrl(st.photo_url);
     setFormMsg(null);
   };
@@ -348,7 +355,14 @@ export function MasterView({
     setName('');
     setStudentClass('');
     setStudentWilayah('putra');
+    setStudentBimbelDays([]);
     setPhotoDataUrl(null);
+  };
+
+  const toggleStudentBimbelDay = (day: string) => {
+    setStudentBimbelDays((prev) =>
+      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]
+    );
   };
 
   const handleStudentFormSubmit = async (e: FormEvent) => {
@@ -363,12 +377,13 @@ export function MasterView({
         class: studentClass.trim(),
         wilayah: studentWilayah,
         photo_url: photoDataUrl,
+        bimbel_days: parseBimbelDays(studentBimbelDays),
       });
       if (res.ok) {
         cancelEditStudent();
         setFormMsg({
           type: 'ok',
-          text: 'Data siswa berhasil diperbarui.',
+          text: 'Data siswa beserta jadwal hari bimbel berhasil diperbarui.',
         });
       } else {
         setFormMsg({ type: 'err', text: res.error || 'Gagal memperbarui data siswa.' });
@@ -379,10 +394,12 @@ export function MasterView({
         class: studentClass.trim(),
         wilayah: studentWilayah,
         photo_url: photoDataUrl,
+        bimbel_days: parseBimbelDays(studentBimbelDays),
       });
       if (res.ok) {
         setName('');
         setStudentClass('');
+        setStudentBimbelDays([]);
         setPhotoDataUrl(null);
         setFormMsg({
           type: 'ok',
@@ -401,12 +418,13 @@ export function MasterView({
     'wilayah',
     'kode_laptop',
     'merk_laptop',
+    'jadwal_bimbel',
     'photo_url',
   ];
   const studentTemplateRows = [
-    ['Rina Putri', '10 IPA 2', 'putri', 'LAP-007', 'Lenovo IdeaPad Slim 3', ''],
-    ['Fajar Pratama', '11 IPS 1', 'putra', 'LAP-008', 'Asus Vivobook 14', ''],
-    ['Zahra Aulia', '12 IPA 2', 'putri', 'LAP-009', 'HP ProBook 440 G8', ''],
+    ['Rina Putri', '10 IPA 2', 'putri', 'LAP-007', 'Lenovo IdeaPad Slim 3', 'Senin, Rabu, Jumat', ''],
+    ['Fajar Pratama', '11 IPS 1', 'putra', 'LAP-008', 'Asus Vivobook 14', 'Selasa, Kamis, Sabtu', ''],
+    ['Zahra Aulia', '12 IPA 2', 'putri', 'LAP-009', 'HP ProBook 440 G8', 'Semua', ''],
   ];
 
   const handleDownloadStudentExcelTemplate = () => {
@@ -415,7 +433,7 @@ export function MasterView({
       'Template Siswa & Laptop',
       studentTemplateHeaders,
       studentTemplateRows,
-      [24, 14, 12, 16, 26, 30]
+      [24, 14, 12, 16, 26, 24, 28]
     );
   };
 
@@ -902,6 +920,7 @@ export function MasterView({
                       <th className="px-2 py-1.5">wilayah</th>
                       <th className="px-2 py-1.5">kode_laptop</th>
                       <th className="px-2 py-1.5">merk_laptop</th>
+                      <th className="px-2 py-1.5">jadwal_bimbel</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-slate-700">
@@ -911,6 +930,7 @@ export function MasterView({
                       <td className="px-2 py-1">putri</td>
                       <td className="px-2 py-1">LAP-007</td>
                       <td className="px-2 py-1">Lenovo Slim 3</td>
+                      <td className="px-2 py-1 font-bold text-emerald-800">Senin, Rabu, Jumat</td>
                     </tr>
                     <tr>
                       <td className="px-2 py-1">Fajar Pratama</td>
@@ -918,6 +938,7 @@ export function MasterView({
                       <td className="px-2 py-1">putra</td>
                       <td className="px-2 py-1">LAP-008</td>
                       <td className="px-2 py-1">Asus Vivobook</td>
+                      <td className="px-2 py-1 font-bold text-emerald-800">Selasa, Kamis, Sabtu</td>
                     </tr>
                   </tbody>
                 </table>
@@ -1022,6 +1043,46 @@ export function MasterView({
                     <option value="putri">Wilayah Putri</option>
                   </select>
                 </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-slate-700">
+                    Jadwal Hari Bimbel Siswa (Deteksi Otomatis Saat Scan)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setStudentBimbelDays([])}
+                    className="text-[11px] font-bold text-blue-700 hover:underline"
+                  >
+                    Semua Hari (Bebas)
+                  </button>
+                </div>
+                <p className="mt-0.5 text-[11px] text-slate-500">
+                  Pilih hari bimbel siswa. Jika siswa men-scan laptop di luar hari yang dipilih, sistem otomatis mendeteksi dan menolak peminjaman.
+                </p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {BIMBEL_DAY_OPTIONS.map((day) => {
+                    const active = studentBimbelDays.includes(day);
+                    return (
+                      <button
+                        key={day}
+                        type="button"
+                        onClick={() => toggleStudentBimbelDay(day)}
+                        className={`rounded-lg px-2.5 py-1 text-xs font-extrabold transition-colors ${
+                          active
+                            ? 'bg-blue-700 text-white shadow-2xs'
+                            : 'border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {day}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="mt-1 text-[11px] font-bold text-indigo-800">
+                  Jadwal Aktif: {formatBimbelDays(studentBimbelDays)}
+                </p>
               </div>
 
               <div>
@@ -1161,6 +1222,9 @@ export function MasterView({
                                     >
                                       {WILAYAH_LABELS[s.wilayah]}
                                     </span>
+                                  </p>
+                                  <p className="mt-0.5 text-[10px] font-bold text-indigo-700">
+                                    Jadwal Bimbel: {formatBimbelDays(s.bimbel_days)}
                                   </p>
                                 </div>
                               </div>

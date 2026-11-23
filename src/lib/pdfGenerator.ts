@@ -1,10 +1,18 @@
 import { jsPDF } from 'jspdf';
-import { CARD_THEMES, Laptop, PrintSettings, Student } from '../types/models';
+import {
+  CARD_THEMES,
+  Laptop,
+  PrintSettings,
+  Student,
+  Transaction,
+  WILAYAH_LABELS,
+} from '../types/models';
 import {
   generateBarcodeDataUrl,
   generateQrDataUrl,
   resolvePhotoForPdf,
 } from './barcode';
+import { formatDateOnly, formatDateTimeID } from './store';
 
 const A4_W = 210;
 const A4_H = 297;
@@ -855,3 +863,314 @@ export async function exportCombinedBundlePdf(
 
   doc.save(`Paket-Kartu-Dan-Gantungan-Tas-${settings.academicYear.replace(/[^\w-]/g, '-')}.pdf`);
 }
+
+export interface UsageReportPdfParams {
+  transactions: Transaction[];
+  students: Student[];
+  laptops: Laptop[];
+  settings?: PrintSettings;
+  periodType: 'harian' | 'bulanan' | 'tahunan' | 'semua';
+  periodLabel: string;
+  wilayahLabel: string;
+  periodBreakdown?: Array<{
+    label: string;
+    total: number;
+    harian: number;
+    pulang: number;
+    late: number;
+  }>;
+}
+
+/**
+ * Export Categorized Usage & Recapitulation Report (Harian / Bulanan / Tahunan / Semua) to A4 Landscape PDF.
+ */
+export async function exportUsageReportPdf(params: UsageReportPdfParams): Promise<void> {
+  const {
+    transactions,
+    students,
+    laptops,
+    settings,
+    periodType,
+    periodLabel,
+    wilayahLabel,
+    periodBreakdown = [],
+  } = params;
+
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+  const pageW = 297;
+  const pageH = 210;
+  const marginX = 12;
+
+  const schoolName = settings?.schoolName || 'LapTrack Sekolah';
+  const academicYear = settings?.academicYear || 'Tahun Ajaran Aktif';
+  const studentMap = new Map(students.map((s) => [s.id, s]));
+  const laptopMap = new Map(laptops.map((l) => [l.id, l]));
+
+  const categoryTitleMap: Record<UsageReportPdfParams['periodType'], string> = {
+    harian: 'LAPORAN REKAPITULASI HARIAN (PER HARI)',
+    bulanan: 'LAPORAN REKAPITULASI BULANAN (PER BULAN)',
+    tahunan: 'LAPORAN REKAPITULASI TAHUNAN (PER TAHUN)',
+    semua: 'LAPORAN REKAPITULASI SELURUH PERIODE',
+  };
+
+  const totalTx = transactions.length;
+  const harianCount = transactions.filter((t) => t.transaction_type !== 'pulang').length;
+  const pulangCount = transactions.filter((t) => t.transaction_type === 'pulang').length;
+  const activeCount = transactions.filter((t) => t.status === 'active').length;
+  const lateCount = transactions.filter((t) => t.is_late).length;
+  const onTimeReturnedCount = transactions.filter(
+    (t) => t.status === 'returned' && !t.is_late
+  ).length;
+
+  const drawReportHeader = (isFirstPage: boolean) => {
+    // Top dark header banner
+    doc.setFillColor(15, 23, 42);
+    doc.roundedRect(marginX, 10, pageW - marginX * 2, 22, 2.2, 2.2, 'F');
+
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(12);
+    doc.text(schoolName.toUpperCase(), marginX + 5, 18);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(203, 213, 225);
+    doc.text(
+      `${categoryTitleMap[periodType]} · ${academicYear}`,
+      marginX + 5,
+      24
+    );
+
+    doc.setFont('courier', 'bold');
+    doc.setFontSize(8.5);
+    doc.setTextColor(253, 224, 71);
+    doc.text(`PERIODE: ${periodLabel.toUpperCase()}`, pageW - marginX - 5, 17.5, {
+      align: 'right',
+    });
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.8);
+    doc.setTextColor(226, 232, 240);
+    doc.text(
+      `Wilayah: ${wilayahLabel} · Dicetak: ${formatDateTimeID(new Date().toISOString())}`,
+      pageW - marginX - 5,
+      24,
+      { align: 'right' }
+    );
+
+    if (!isFirstPage) return 36;
+
+    // Summary KPI Cards on Page 1
+    const kpis = [
+      { label: 'TOTAL TRANSAKSI', value: String(totalTx), rgb: [30, 64, 175] as [number, number, number] },
+      { label: 'SESI HARIAN & KEGIATAN', value: String(harianCount), rgb: [2, 132, 199] as [number, number, number] },
+      { label: 'IZIN KEPULANGAN', value: String(pulangCount), rgb: [109, 40, 217] as [number, number, number] },
+      { label: 'MASIH DIPAKAI', value: String(activeCount), rgb: [217, 119, 6] as [number, number, number] },
+      { label: 'KEMBALI TEPAT WAKTU', value: String(onTimeReturnedCount), rgb: [5, 150, 105] as [number, number, number] },
+      { label: 'TERLAMBAT KEMBALI', value: String(lateCount), rgb: [225, 29, 72] as [number, number, number] },
+    ];
+
+    const gap = 3.5;
+    const cardW = (pageW - marginX * 2 - gap * (kpis.length - 1)) / kpis.length;
+    const cardY = 35.5;
+    const cardH = 14.5;
+
+    kpis.forEach((kpi, idx) => {
+      const cx = marginX + idx * (cardW + gap);
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(203, 213, 225);
+      doc.setLineWidth(0.25);
+      doc.roundedRect(cx, cardY, cardW, cardH, 1.6, 1.6, 'FD');
+
+      doc.setFillColor(...kpi.rgb);
+      doc.rect(cx, cardY, 1.8, cardH, 'F');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(6.2);
+      doc.setTextColor(100, 116, 139);
+      doc.text(kpi.label, cx + 4, cardY + 5);
+
+      doc.setFont('courier', 'bold');
+      doc.setFontSize(11.5);
+      doc.setTextColor(...kpi.rgb);
+      doc.text(kpi.value, cx + 4, cardY + 11.6);
+    });
+
+    let nextY = cardY + cardH + 4;
+
+    // Optional Period Breakdown Summary strip
+    const nonEmptyBreakdown = periodBreakdown.filter((b) => b.total > 0).slice(0, 8);
+    if (nonEmptyBreakdown.length > 0) {
+      doc.setFillColor(241, 245, 249);
+      doc.setDrawColor(203, 213, 225);
+      doc.roundedRect(marginX, nextY, pageW - marginX * 2, 10.5, 1.5, 1.5, 'FD');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(6.8);
+      doc.setTextColor(30, 41, 59);
+      doc.text('RINGKASAN KATEGORI PERIODE:', marginX + 3.5, nextY + 4.2);
+
+      const summaryText = nonEmptyBreakdown
+        .map(
+          (b) =>
+            `${b.label}: ${b.total} transaksi (Harian ${b.harian}, Pulang ${b.pulang}, Telat ${b.late})`
+        )
+        .join('   |   ');
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6.5);
+      doc.setTextColor(71, 85, 105);
+      doc.text(truncateText(doc, summaryText, pageW - marginX * 2 - 7), marginX + 3.5, nextY + 8.3);
+
+      nextY += 13.5;
+    }
+
+    return nextY;
+  };
+
+  // Table column definitions (total width = 273 mm)
+  const columns = [
+    { header: 'NO', width: 9 },
+    { header: 'WAKTU AMBIL', width: 31 },
+    { header: 'WAKTU KEMBALI', width: 31 },
+    { header: 'KODE & NAMA SISWA', width: 52 },
+    { header: 'KELAS / WIL', width: 24 },
+    { header: 'TAS LAPTOP', width: 33 },
+    { header: 'JENIS & SESI / KEPERLUAN', width: 45 },
+    { header: 'STATUS', width: 24 },
+    { header: 'GURU PIKET', width: 24 },
+  ];
+
+  const drawTableHeader = (y: number) => {
+    doc.setFillColor(30, 41, 59);
+    doc.rect(marginX, y, pageW - marginX * 2, 7.5, 'F');
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(6.8);
+    doc.setTextColor(255, 255, 255);
+
+    let colX = marginX;
+    columns.forEach((col) => {
+      doc.text(col.header, colX + 2, y + 5.1);
+      colX += col.width;
+    });
+
+    return y + 7.5;
+  };
+
+  let curY = drawReportHeader(true);
+  curY = drawTableHeader(curY);
+  const rowH = 8.2;
+  const maxY = pageH - 14;
+
+  if (transactions.length === 0) {
+    doc.setFillColor(248, 250, 252);
+    doc.setDrawColor(226, 232, 240);
+    doc.rect(marginX, curY, pageW - marginX * 2, 16, 'FD');
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(100, 116, 139);
+    doc.text(
+      'Tidak ada data transaksi pemakaian laptop pada periode laporan yang dipilih.',
+      pageW / 2,
+      curY + 9.5,
+      { align: 'center' }
+    );
+  } else {
+    transactions.forEach((tx, index) => {
+      if (curY + rowH > maxY) {
+        doc.addPage('a4', 'landscape');
+        curY = drawReportHeader(false);
+        curY = drawTableHeader(curY);
+      }
+
+      const st = studentMap.get(tx.student_id);
+      const lp = laptopMap.get(tx.laptop_id);
+
+      if (index % 2 === 1) {
+        doc.setFillColor(248, 250, 252);
+        doc.rect(marginX, curY, pageW - marginX * 2, rowH, 'F');
+      }
+
+      doc.setDrawColor(226, 232, 240);
+      doc.setLineWidth(0.15);
+      doc.line(marginX, curY + rowH, pageW - marginX, curY + rowH);
+
+      const studentLabel = st ? `${st.student_code} · ${st.name}` : 'Siswa Terhapus';
+      const classWilLabel = `${st?.class || '—'} · ${WILAYAH_LABELS[tx.wilayah].replace('Wilayah ', '')}`;
+      const laptopLabel = lp ? `${lp.asset_code} (${lp.brand_model})` : '—';
+      const sessionDetail =
+        tx.custom_activity || tx.home_note
+          ? `${tx.purpose} (${tx.custom_activity || tx.home_note})`
+          : tx.purpose;
+      const statusText =
+        tx.status === 'active'
+          ? tx.transaction_type === 'pulang'
+            ? 'Dibawa Pulang'
+            : 'Masih Dipakai'
+          : tx.is_late
+          ? `Telat ${tx.late_minutes}m`
+          : 'Tepat Waktu';
+      const returnText = tx.return_time
+        ? formatDateTimeID(tx.return_time)
+        : tx.transaction_type === 'pulang'
+        ? `Batas ${formatDateOnly(tx.due_time)}`
+        : 'Belum Kembali';
+      const piketLabel = tx.return_piket_name
+        ? `${tx.piket_name} / ${tx.return_piket_name}`
+        : tx.piket_name;
+
+      const rowValues = [
+        String(index + 1),
+        formatDateTimeID(tx.borrow_time),
+        returnText,
+        studentLabel,
+        classWilLabel,
+        laptopLabel,
+        sessionDetail,
+        statusText,
+        piketLabel,
+      ];
+
+      let colX = marginX;
+      rowValues.forEach((val, colIdx) => {
+        const colW = columns[colIdx].width;
+        doc.setFont(colIdx === 0 || colIdx === 5 ? 'courier' : 'helvetica', colIdx === 3 || colIdx === 7 ? 'bold' : 'normal');
+        doc.setFontSize(6.6);
+        if (colIdx === 7) {
+          if (tx.status === 'active') {
+            doc.setTextColor(180, 83, 9);
+          } else if (tx.is_late) {
+            doc.setTextColor(190, 18, 60);
+          } else {
+            doc.setTextColor(4, 120, 87);
+          }
+        } else {
+          doc.setTextColor(15, 23, 42);
+        }
+        doc.text(truncateText(doc, val, colW - 3.5), colX + 2, curY + 5.3);
+        colX += colW;
+      });
+
+      curY += rowH;
+    });
+  }
+
+  const totalPages = doc.getNumberOfPages();
+  for (let p = 1; p <= totalPages; p++) {
+    doc.setPage(p);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.2);
+    doc.setTextColor(100, 116, 139);
+    doc.text(
+      `${categoryTitleMap[periodType]} — ${periodLabel} · ${schoolName}`,
+      marginX,
+      pageH - 5.5
+    );
+    doc.text(`Halaman ${p} dari ${totalPages}`, pageW - marginX, pageH - 5.5, {
+      align: 'right',
+    });
+  }
+
+  const safePeriod = periodLabel.replace(/[^a-zA-Z0-9_-]+/g, '-');
+  doc.save(`Laporan-Pemakaian-${periodType.toUpperCase()}-${safePeriod}.pdf`);
+}
+
