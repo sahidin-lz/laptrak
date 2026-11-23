@@ -184,12 +184,19 @@ export default function App() {
 
       saveStateToLocalQuotaCache(effectiveState);
 
+      const hadDummyPurged =
+        (Array.isArray(cachedOrFirestoreBundle?.staff) &&
+          cachedOrFirestoreBundle.staff.length !== effectiveState.staff.length) ||
+        (Array.isArray(cachedOrFirestoreBundle?.students) &&
+          cachedOrFirestoreBundle.students.length !== effectiveState.students.length);
+
       // Push to Firestore ONLY if:
       // 1. The cloud document genuinely does not exist yet on Firestore (`cloudStatus === 'not_found'`), OR
-      // 2. This device has newer unsynced changes (`bestTime > cloudTime` and `cloudStatus === 'found'`)
+      // 2. This device has newer unsynced changes (`bestTime > cloudTime` and `cloudStatus === 'found'`), OR
+      // 3. Legacy dummy staff/students were sanitized out from the cloud bundle.
       if (
         cloudStatus === 'not_found' ||
-        (cloudStatus === 'found' && bestTime > cloudTime)
+        (cloudStatus === 'found' && (bestTime > cloudTime || hadDummyPurged))
       ) {
         flushStateToFirestoreNow(effectiveState);
       }

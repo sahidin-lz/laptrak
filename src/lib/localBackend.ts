@@ -28,6 +28,7 @@ import {
   findStudentByScannedCode,
   generateNextUniqueLaptopCode,
   generateNextUniqueStudentCode,
+  isLegacyDummyStaff,
   normalizeCodeCompact,
   parseBimbelDays,
   sanitizeDatabaseRecords,
@@ -199,7 +200,7 @@ function createInitialLocalDb(): LocalDatabase {
       id: 'stf-2',
       name: 'Anis Fahrurozi',
       username: 'anis.fahrurozi',
-      passwordPlain: 'Admin@Anis26',
+      passwordPlain: '121320',
       piket_token: 'ADM-102',
       role: 'admin',
       wilayah: 'semua',
@@ -210,7 +211,7 @@ function createInitialLocalDb(): LocalDatabase {
       id: 'stf-3',
       name: 'Fadly Muhammad',
       username: 'fadly.muhammad',
-      passwordPlain: 'Admin@Fadly26',
+      passwordPlain: '121320',
       piket_token: 'ADM-103',
       role: 'admin',
       wilayah: 'semua',
@@ -221,54 +222,10 @@ function createInitialLocalDb(): LocalDatabase {
       id: 'stf-4',
       name: 'Yusufa Mardha',
       username: 'yusufa.mardha',
-      passwordPlain: 'Admin@Yusufa26',
+      passwordPlain: '121320',
       piket_token: 'ADM-104',
       role: 'admin',
       wilayah: 'semua',
-      is_active: true,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stf-5',
-      name: 'Ustadz Hendra Saputra (Piket Putra)',
-      username: 'piket.putra',
-      passwordPlain: 'Piket@Sekolah26',
-      piket_token: 'PKT-201',
-      role: 'piket',
-      wilayah: 'putra',
-      is_active: true,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stf-6',
-      name: 'Ibu Ratna Sari (Piket Putri)',
-      username: 'piket.putri',
-      passwordPlain: 'Piket@Sekolah26',
-      piket_token: 'PKT-202',
-      role: 'piket',
-      wilayah: 'putri',
-      is_active: true,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stf-7',
-      name: 'Ustadz Ridwan Kamil (Piket Malam Putra)',
-      username: 'piket.malam.pa',
-      passwordPlain: 'Piket@Sekolah26',
-      piket_token: 'PKT-203',
-      role: 'piket',
-      wilayah: 'putra',
-      is_active: true,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stf-8',
-      name: 'Ustadzah Aisyah Nur (Piket Malam Putri)',
-      username: 'piket.malam.pi',
-      passwordPlain: 'Piket@Sekolah26',
-      piket_token: 'PKT-204',
-      role: 'piket',
-      wilayah: 'putri',
       is_active: true,
       created_at: twoDaysAgo.toISOString(),
     },
@@ -343,6 +300,19 @@ function loadLocalDb(): LocalDatabase {
         parsed.laptops = sanitized.laptops;
         parsed.transactions = sanitized.transactions;
         parsed.studentSeq = Math.max(1, sanitized.nextStudentSeq);
+        if (Array.isArray(parsed.staff)) {
+          parsed.staff = parsed.staff.filter((s) => !isLegacyDummyStaff(s));
+        }
+        if (
+          parsed.kioskState?.piketTicket &&
+          isLegacyDummyStaff({
+            id: parsed.kioskState.piketTicket.id,
+            name: parsed.kioskState.piketTicket.name,
+          })
+        ) {
+          parsed.kioskState.piketTicket = null;
+          parsed.kioskState.wizardStep = 'piket_login';
+        }
 
         if (!parsed.updatedAtMs && (parsed.laptops.length > 0 || parsed.students.length > 0)) {
           parsed.updatedAtMs = Date.now();
@@ -474,6 +444,17 @@ function buildAppState(touchModified = true): AppStatePayload {
   localDb.laptops = sanitized.laptops;
   localDb.transactions = sanitized.transactions;
   localDb.studentSeq = Math.max(1, sanitized.nextStudentSeq);
+  localDb.staff = localDb.staff.filter((s) => !isLegacyDummyStaff(s));
+  if (
+    localDb.kioskState?.piketTicket &&
+    isLegacyDummyStaff({
+      id: localDb.kioskState.piketTicket.id,
+      name: localDb.kioskState.piketTicket.name,
+    })
+  ) {
+    localDb.kioskState.piketTicket = null;
+    localDb.kioskState.wizardStep = 'piket_login';
+  }
 
   refreshExpiredSuspensions(localDb.students);
 
@@ -552,10 +533,22 @@ export function mirrorStateToLocalDb(state: Partial<AppStatePayload> | null | un
     const prevPasswords = new Map(
       localDb.staff.map((s) => [s.id, s.passwordPlain])
     );
-    localDb.staff = state.staff.map((incoming) => ({
-      ...incoming,
-      passwordPlain: prevPasswords.get(incoming.id) || '121320',
-    }));
+    localDb.staff = state.staff
+      .filter((incoming) => !isLegacyDummyStaff(incoming))
+      .map((incoming) => ({
+        ...incoming,
+        passwordPlain: prevPasswords.get(incoming.id) || '121320',
+      }));
+  }
+  if (
+    localDb.kioskState?.piketTicket &&
+    isLegacyDummyStaff({
+      id: localDb.kioskState.piketTicket.id,
+      name: localDb.kioskState.piketTicket.name,
+    })
+  ) {
+    localDb.kioskState.piketTicket = null;
+    localDb.kioskState.wizardStep = 'piket_login';
   }
   if (typeof state.updatedAtMs === 'number' && state.updatedAtMs > 0) {
     localDb.updatedAtMs = state.updatedAtMs;
@@ -641,8 +634,26 @@ export const localBackend = {
 
   login: async (username: string, password: string): Promise<LoginResponse> => {
     const cleanUser = (username || '').trim().toLowerCase();
+    const compactUser = normalizeCodeCompact(cleanUser);
     const cleanPass = (password || '').trim();
-    const stf = localDb.staff.find((s) => s.username.toLowerCase() === cleanUser);
+    const compactPass = normalizeCodeCompact(cleanPass);
+
+    const stf = localDb.staff.find((s) => {
+      const uLower = s.username.trim().toLowerCase();
+      const nLower = s.name.trim().toLowerCase();
+      const tLower = s.piket_token.trim().toLowerCase();
+      const firstWord = nLower.split(/\s+/)[0];
+      return (
+        uLower === cleanUser ||
+        nLower === cleanUser ||
+        tLower === cleanUser ||
+        firstWord === cleanUser ||
+        (compactUser.length >= 3 &&
+          (normalizeCodeCompact(uLower) === compactUser ||
+            normalizeCodeCompact(nLower) === compactUser ||
+            normalizeCodeCompact(tLower) === compactUser))
+      );
+    });
     if (!stf) {
       throw new ApiError('Username atau password salah.', 401);
     }
@@ -650,19 +661,43 @@ export const localBackend = {
       throw new ApiError('Akun Anda sedang dinonaktifkan oleh Administrator.', 403);
     }
 
+    const allAdminPasswords = localDb.staff
+      .filter((s) => s.role === 'admin' && s.passwordPlain)
+      .map((s) => s.passwordPlain);
+
     const acceptedAdminPasswords = new Set([
       stf.passwordPlain,
+      stf.piket_token.trim(),
+      stf.piket_token.trim().toLowerCase(),
+      stf.piket_token.trim().toUpperCase(),
+      ...allAdminPasswords,
       '121320',
+      'admin123',
       'Admin@Sahidin26',
       'Admin@Anis26',
       'Admin@Fadly26',
       'Admin@Yusufa26',
+      'ADM-101',
+      'ADM-102',
+      'ADM-103',
+      'ADM-104',
+      'adm-101',
+      'adm-102',
+      'adm-103',
+      'adm-104',
     ]);
+
+    const tokenCompact = normalizeCodeCompact(stf.piket_token);
 
     const isPasswordValid =
       stf.role === 'admin'
-        ? acceptedAdminPasswords.has(cleanPass) || acceptedAdminPasswords.has(password)
-        : password === stf.passwordPlain || cleanPass === '121320';
+        ? acceptedAdminPasswords.has(cleanPass) ||
+          acceptedAdminPasswords.has(password) ||
+          (compactPass.length >= 5 && compactPass === tokenCompact)
+        : password === stf.passwordPlain ||
+          cleanPass === '121320' ||
+          cleanPass.toUpperCase() === stf.piket_token.trim().toUpperCase() ||
+          (compactPass.length >= 5 && compactPass === tokenCompact);
 
     if (!isPasswordValid) {
       throw new ApiError('Username atau password salah.', 401);
@@ -755,20 +790,22 @@ export const localBackend = {
       localDb.updatedAtMs = Math.max(incomingTime, localTime);
     }
 
-    // Sync staff accounts while preserving local passwords
+    // Sync staff accounts while preserving local passwords and purging legacy dummy staff
     if (Array.isArray(bundle.staff) && bundle.staff.length > 0 && shouldAdoptIncoming) {
       const prevPasswords = new Map<string, string>();
       for (const s of localDb.staff) {
         prevPasswords.set(s.id, s.passwordPlain);
         prevPasswords.set(s.username.toLowerCase(), s.passwordPlain);
       }
-      localDb.staff = bundle.staff.map((incoming) => ({
-        ...incoming,
-        passwordPlain:
-          prevPasswords.get(incoming.id) ||
-          prevPasswords.get(incoming.username.toLowerCase()) ||
-          '121320',
-      }));
+      localDb.staff = bundle.staff
+        .filter((incoming) => !isLegacyDummyStaff(incoming))
+        .map((incoming) => ({
+          ...incoming,
+          passwordPlain:
+            prevPasswords.get(incoming.id) ||
+            prevPasswords.get(incoming.username.toLowerCase()) ||
+            '121320',
+        }));
     }
 
     return buildAppState(false);

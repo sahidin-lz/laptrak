@@ -1047,6 +1047,41 @@ const LEGACY_DUMMY_TX_IDS = new Set([
   'tx-6',
 ]);
 
+const LEGACY_DUMMY_STAFF_IDS = new Set([
+  'stf-5',
+  'stf-6',
+  'stf-7',
+  'stf-8',
+]);
+
+const LEGACY_DUMMY_STAFF_USERNAMES = new Set([
+  'piket.putra',
+  'piket.putri',
+  'piket.malam.pa',
+  'piket.malam.pi',
+]);
+
+const LEGACY_DUMMY_STAFF_NAMES = new Set([
+  'ustadz hendra saputra (piket putra)',
+  'ibu ratna sari (piket putri)',
+  'ustadz ridwan kamil (piket malam putra)',
+  'ustadzah aisyah nur (piket malam putri)',
+]);
+
+export function isLegacyDummyStaff(
+  s: { id?: string; username?: string; name?: string } | null | undefined
+): boolean {
+  if (!s) return false;
+  if (s.id && LEGACY_DUMMY_STAFF_IDS.has(s.id)) return true;
+  if (s.username && LEGACY_DUMMY_STAFF_USERNAMES.has(s.username.trim().toLowerCase())) {
+    return true;
+  }
+  if (s.name && LEGACY_DUMMY_STAFF_NAMES.has(s.name.trim().toLowerCase())) {
+    return true;
+  }
+  return false;
+}
+
 export function isLegacyDummyStudent(s: Student | null | undefined): boolean {
   if (!s) return false;
   if (LEGACY_DUMMY_STUDENT_IDS.has(s.id)) return true;

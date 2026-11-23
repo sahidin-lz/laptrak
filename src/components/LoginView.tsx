@@ -119,14 +119,31 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
 
             <div className="mt-6 space-y-3 border-t border-white/15 pt-5">
               <p className="text-xs font-bold text-cyan-200">
-                4 Akun Admin Default
+                4 Akun Administrator Resmi
               </p>
-              <ul className="space-y-1 text-xs text-indigo-100">
-                <li>Sahidin · <span className="font-mono text-white">sahidin</span></li>
-                <li>Anis Fahrurozi · <span className="font-mono text-white">anis.fahrurozi</span></li>
-                <li>Fadly Muhammad · <span className="font-mono text-white">fadly.muhammad</span></li>
-                <li>Yusufa Mardha · <span className="font-mono text-white">yusufa.mardha</span></li>
+              <ul className="space-y-1.5 text-xs text-indigo-100">
+                <li>
+                  Sahidin · <span className="font-mono text-white">sahidin</span>{' '}
+                  <span className="font-mono text-[11px] text-amber-300">(ADM-101)</span>
+                </li>
+                <li>
+                  Anis Fahrurozi · <span className="font-mono text-white">anis.fahrurozi</span>{' '}
+                  <span className="font-mono text-[11px] text-amber-300">(ADM-102)</span>
+                </li>
+                <li>
+                  Fadly Muhammad · <span className="font-mono text-white">fadly.muhammad</span>{' '}
+                  <span className="font-mono text-[11px] text-amber-300">(ADM-103)</span>
+                </li>
+                <li>
+                  Yusufa Mardha · <span className="font-mono text-white">yusufa.mardha</span>{' '}
+                  <span className="font-mono text-[11px] text-amber-300">(ADM-104)</span>
+                </li>
               </ul>
+              <p className="text-[11px] leading-relaxed text-cyan-100/90">
+                Ke-4 akun Administrator dapat login menggunakan password{' '}
+                <span className="font-mono font-bold text-white">121320</span> atau kode Token Kartu{' '}
+                <span className="font-mono font-bold text-amber-300">ADM-101 s/d ADM-104</span>.
+              </p>
             </div>
           </div>
 
@@ -238,26 +255,31 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
                   Masuk Dashboard Administrator
                 </h3>
                 <p className="mt-1 text-xs text-slate-500">
-                  Pilih cepat akun Admin di bawah dan masukkan password Anda.
+                  Pilih cepat salah satu dari 4 akun Admin di bawah, lalu masukkan password (<span className="font-mono font-bold text-slate-700">121320</span> atau kode Token Kartu <span className="font-mono font-bold text-indigo-700">ADM-101 s/d ADM-104</span>).
                 </p>
 
                 <div className="mt-4">
                   <p className="mb-1.5 text-[11px] font-bold text-slate-500">
-                    Pilih cepat username Admin:
+                    Pilih cepat akun Administrator:
                   </p>
                   <div className="flex flex-wrap gap-1.5">
-                    {['sahidin', 'anis.fahrurozi', 'fadly.muhammad', 'yusufa.mardha'].map((u) => (
+                    {[
+                      { u: 'sahidin', label: 'sahidin (ADM-101)' },
+                      { u: 'anis.fahrurozi', label: 'anis.fahrurozi (ADM-102)' },
+                      { u: 'fadly.muhammad', label: 'fadly.muhammad (ADM-103)' },
+                      { u: 'yusufa.mardha', label: 'yusufa.mardha (ADM-104)' },
+                    ].map((item) => (
                       <button
-                        key={u}
+                        key={item.u}
                         type="button"
-                        onClick={() => setUsername(u)}
+                        onClick={() => setUsername(item.u)}
                         className={`rounded-lg border px-2.5 py-1.5 font-mono text-[11px] font-bold transition-all ${
-                          username === u
+                          username === item.u
                             ? 'border-indigo-600 bg-indigo-600 text-white shadow-xs'
                             : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-indigo-50 hover:text-indigo-700'
                         }`}
                       >
-                        {u}
+                        {item.label}
                       </button>
                     ))}
                   </div>
@@ -266,7 +288,7 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
                 <form onSubmit={handleLogin} className="mt-5 space-y-4">
                   <div>
                     <label className="mb-1.5 block text-xs font-bold text-slate-700">
-                      Username Admin
+                      Username / Nama / Token Admin
                     </label>
                     <div className="relative">
                       <User className="pointer-events-none absolute top-1/2 left-3.5 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -276,7 +298,7 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
                         type="text"
                         value={username}
                         onChange={(e) => setUsername(e.target.value)}
-                        placeholder="contoh: sahidin"
+                        placeholder="contoh: anis.fahrurozi atau ADM-102"
                         className="w-full rounded-xl border border-slate-200 py-2.5 pr-3 pl-10 font-mono text-sm outline-none focus:border-indigo-600"
                       />
                     </div>
@@ -284,7 +306,7 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
 
                   <div>
                     <label className="mb-1.5 block text-xs font-bold text-slate-700">
-                      Password
+                      Password / Token Kode Barcode
                     </label>
                     <div className="relative">
                       <Lock className="pointer-events-none absolute top-1/2 left-3.5 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -294,7 +316,7 @@ export function LoginView({ onAuthenticated, onClose }: LoginViewProps) {
                         type={showPass ? 'text' : 'password'}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        placeholder="Masukkan password Admin"
+                        placeholder="Masukkan password (121320 / ADM-101..ADM-104)"
                         className="w-full rounded-xl border border-slate-200 py-2.5 pr-10 pl-10 text-sm outline-none focus:border-indigo-600"
                       />
                       <button
