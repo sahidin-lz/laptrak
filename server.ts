@@ -29,8 +29,11 @@ import {
 import {
   extractPrefixAndNumber,
   findStudentByScannedCode,
+  generateNextUniqueLaptopCode,
+  generateNextUniqueStudentCode,
   normalizeCodeCompact,
   parseBimbelDays,
+  sanitizeDatabaseRecords,
   validateDailySessionSelection,
   validateStudentBimbelSchedule,
 } from './src/lib/store';
@@ -721,6 +724,15 @@ function loadServerDbFromDisk(): ServerDatabase {
       const raw = fs.readFileSync(SERVER_DISK_DB_PATH, 'utf8');
       const parsed = JSON.parse(raw) as ServerDatabase;
       if (parsed && Array.isArray(parsed.students) && Array.isArray(parsed.laptops)) {
+        const sanitized = sanitizeDatabaseRecords({
+          students: parsed.students,
+          laptops: parsed.laptops,
+          transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
+        });
+        parsed.students = sanitized.students;
+        parsed.laptops = sanitized.laptops;
+        parsed.studentSeq = Math.max(parsed.studentSeq || 1, sanitized.nextStudentSeq);
+
         if (typeof parsed.updatedAtMs !== 'number') {
           parsed.updatedAtMs =
             parsed.laptops.length > 6 || parsed.students.length > 6 ? Date.now() : 0;
@@ -822,6 +834,15 @@ function getActivePiketOptions(): PiketOption[] {
 }
 
 function ensureServerStudentsHaveLaptopAllocation() {
+  const preSanitized = sanitizeDatabaseRecords({
+    students: db.students,
+    laptops: db.laptops,
+    transactions: db.transactions,
+  });
+  db.students = preSanitized.students;
+  db.laptops = preSanitized.laptops;
+  db.studentSeq = Math.max(db.studentSeq || 1, preSanitized.nextStudentSeq);
+
   const assignedStudentIds = new Set(
     db.laptops.map((l) => l.assigned_student_id).filter(Boolean) as string[]
   );
@@ -840,6 +861,7 @@ function ensureServerStudentsHaveLaptopAllocation() {
       (l) =>
         !l.assigned_student_id &&
         (l.asset_code.toUpperCase() === desiredLapCode.toUpperCase() ||
+          normalizeCodeCompact(l.asset_code) === normalizeCodeCompact(desiredLapCode) ||
           (parsedStu.num !== null &&
             extractPrefixAndNumber(l.asset_code).num === parsedStu.num))
     );
@@ -850,30 +872,10 @@ function ensureServerStudentsHaveLaptopAllocation() {
       continue;
     }
 
-    if (!db.laptops.some((l) => l.asset_code.toUpperCase() === desiredLapCode.toUpperCase())) {
-      db.laptops.push({
-        id: makeId('lap'),
-        asset_code: desiredLapCode.toUpperCase(),
-        brand_model: 'Laptop Sekolah',
-        status: 'available',
-        assigned_student_id: st.id,
-        created_at: nowIso,
-      });
-      assignedStudentIds.add(st.id);
-      continue;
-    }
-
-    let nextNum = Math.max(db.laptops.length + 1, parsedStu.num || 1);
-    while (
-      db.laptops.some(
-        (l) => l.asset_code.toUpperCase() === `LAP-${String(nextNum).padStart(3, '0')}`
-      )
-    ) {
-      nextNum++;
-    }
+    const uniqueAssetCode = generateNextUniqueLaptopCode(db.laptops, parsedStu.num);
     db.laptops.push({
       id: makeId('lap'),
-      asset_code: `LAP-${String(nextNum).padStart(3, '0')}`,
+      asset_code: uniqueAssetCode,
       brand_model: 'Laptop Sekolah',
       status: 'available',
       assigned_student_id: st.id,
@@ -884,6 +886,15 @@ function ensureServerStudentsHaveLaptopAllocation() {
 }
 
 function buildStateForRole(_role: StaffRole | 'public', touchModified = true) {
+  const sanitized = sanitizeDatabaseRecords({
+    students: db.students,
+    laptops: db.laptops,
+    transactions: db.transactions,
+  });
+  db.students = sanitized.students;
+  db.laptops = sanitized.laptops;
+  db.studentSeq = Math.max(db.studentSeq || 1, sanitized.nextStudentSeq);
+
   refreshExpiredSuspensions(db.students);
   if (touchModified) {
     db.updatedAtMs = Date.now();
@@ -1715,9 +1726,11 @@ async function startServer() {
       return;
     }
 
+    const genCode = generateNextUniqueStudentCode(db.students, db.studentSeq);
+    db.studentSeq = genCode.nextSeq;
     const created: Student = {
       id: makeId('stu'),
-      student_code: formatStudentCode(db.studentSeq++),
+      student_code: genCode.code,
       name: name.slice(0, 120),
       class: studentClass.slice(0, 40),
       wilayah,
@@ -1795,7 +1808,9 @@ async function startServer() {
 
       let student = db.students.find(
         (s) =>
-          (customCode && s.student_code.toUpperCase() === customCode) ||
+          (customCode &&
+            (s.student_code.toUpperCase() === customCode ||
+              normalizeCodeCompact(s.student_code) === normalizeCodeCompact(customCode))) ||
           (s.name.trim().toLowerCase() === name.toLowerCase() &&
             s.class.trim().toLowerCase() === cls.toLowerCase())
       );
@@ -1804,16 +1819,36 @@ async function startServer() {
         student.name = name.slice(0, 120);
         student.class = cls.slice(0, 40);
         student.wilayah = wilayah;
-        if (customCode) student.student_code = customCode.slice(0, 40);
+        if (
+          customCode &&
+          !db.students.some(
+            (other) =>
+              other.id !== student!.id &&
+              normalizeCodeCompact(other.student_code) === normalizeCodeCompact(customCode)
+          )
+        ) {
+          student.student_code = customCode.slice(0, 40);
+        }
         if (photoUrl) student.photo_url = photoUrl;
         if (raw?.bimbel_days !== undefined) {
           student.bimbel_days = parsedBimbel;
         }
         createdStudents++;
       } else {
+        let nextCode = customCode;
+        if (
+          !nextCode ||
+          db.students.some(
+            (s) => normalizeCodeCompact(s.student_code) === normalizeCodeCompact(nextCode)
+          )
+        ) {
+          const gen = generateNextUniqueStudentCode(db.students, db.studentSeq);
+          nextCode = gen.code;
+          db.studentSeq = gen.nextSeq;
+        }
         student = {
           id: makeId('stu'),
-          student_code: (customCode || formatStudentCode(db.studentSeq++)).slice(0, 40),
+          student_code: nextCode.slice(0, 40),
           name: name.slice(0, 120),
           class: cls.slice(0, 40),
           wilayah,
@@ -2053,9 +2088,11 @@ async function startServer() {
       if (studentRef) {
         matchedStudent = findStudentByScannedCode(studentRef, db.students, db.laptops);
         if (!matchedStudent && !/^SIS[-_]?\d+$/i.test(studentRef) && studentRef.length >= 2) {
+          const gen = generateNextUniqueStudentCode(db.students, db.studentSeq);
+          db.studentSeq = gen.nextSeq;
           const newStu: Student = {
             id: makeId('stu'),
-            student_code: formatStudentCode(db.studentSeq++),
+            student_code: gen.code,
             name: studentRef.slice(0, 120),
             class: '10',
             wilayah: 'putra',

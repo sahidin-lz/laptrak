@@ -10,6 +10,7 @@ import {
   StaffRole,
   StaffWilayah,
   Student,
+  Transaction,
   Wilayah,
 } from '../types/models';
 
@@ -765,8 +766,8 @@ export function parseStaffCsv(text: string): ParsedStaffRow[] {
 
 /**
  * Normalizes a barcode/QR code string by stripping spaces, hyphens, underscores,
- * and common prefixes so codes like "SIS-0007", "SIS0007", "SIS-7", "0007",
- * "LAP-007", "LAP007", "PKT-205", "PKT205" can be matched reliably.
+ * and common punctuation so codes like "SIS-0007", "SIS0007", "LAP-007", "LAP007",
+ * "PKT-205", "PKT205" can be matched reliably.
  */
 export function normalizeCodeCompact(raw: string): string {
   return (raw || '')
@@ -786,8 +787,281 @@ export function extractPrefixAndNumber(raw: string): { prefix: string; num: numb
 }
 
 /**
+ * Generates the next guaranteed-unique Student Code (`SIS-XXXX`) that does not collide
+ * with any existing student_code in `students`.
+ */
+export function generateNextUniqueStudentCode(
+  students: Student[],
+  startSeq = 1
+): { code: string; nextSeq: number } {
+  const usedExact = new Set<string>();
+  const usedCompact = new Set<string>();
+  const usedSisNumbers = new Set<number>();
+  let maxNumber = 0;
+
+  for (const s of students) {
+    const raw = (s.student_code || '').trim().toUpperCase();
+    if (!raw) continue;
+    usedExact.add(raw);
+    usedCompact.add(normalizeCodeCompact(raw));
+    const parsed = extractPrefixAndNumber(raw);
+    if (
+      parsed.num !== null &&
+      (parsed.prefix === 'SIS' || parsed.prefix === 'SISWA' || parsed.prefix === '')
+    ) {
+      usedSisNumbers.add(parsed.num);
+      if (parsed.num > maxNumber) maxNumber = parsed.num;
+    }
+  }
+
+  let candidateSeq = Math.max(1, startSeq, maxNumber + 1);
+  // First try startSeq if it isn't taken, otherwise advance until free
+  let probe = Math.max(1, startSeq);
+  while (
+    usedSisNumbers.has(probe) ||
+    usedExact.has(`SIS-${String(probe).padStart(4, '0')}`) ||
+    usedCompact.has(`SIS${String(probe).padStart(4, '0')}`)
+  ) {
+    probe++;
+  }
+  candidateSeq = probe;
+  const code = `SIS-${String(candidateSeq).padStart(4, '0')}`;
+  return { code, nextSeq: Math.max(candidateSeq + 1, maxNumber + 1) };
+}
+
+/**
+ * Generates a guaranteed-unique Laptop Asset Code (`LAP-XXX`) that does not collide
+ * with any existing asset_code in `laptops`.
+ */
+export function generateNextUniqueLaptopCode(
+  laptops: Laptop[],
+  preferredNum?: number | null
+): string {
+  const usedExact = new Set<string>();
+  const usedCompact = new Set<string>();
+  const usedLapNumbers = new Set<number>();
+
+  for (const l of laptops) {
+    const raw = (l.asset_code || '').trim().toUpperCase();
+    if (!raw) continue;
+    usedExact.add(raw);
+    usedCompact.add(normalizeCodeCompact(raw));
+    const parsed = extractPrefixAndNumber(raw);
+    if (
+      parsed.num !== null &&
+      (parsed.prefix === 'LAP' || parsed.prefix === 'TAS' || parsed.prefix === '')
+    ) {
+      usedLapNumbers.add(parsed.num);
+    }
+  }
+
+  if (preferredNum && preferredNum > 0) {
+    const desired = `LAP-${String(preferredNum).padStart(3, '0')}`;
+    if (
+      !usedExact.has(desired) &&
+      !usedCompact.has(normalizeCodeCompact(desired)) &&
+      !usedLapNumbers.has(preferredNum)
+    ) {
+      return desired;
+    }
+  }
+
+  let probe = preferredNum && preferredNum > 0 ? preferredNum : 1;
+  while (
+    usedLapNumbers.has(probe) ||
+    usedExact.has(`LAP-${String(probe).padStart(3, '0')}`) ||
+    usedCompact.has(`LAP${String(probe).padStart(3, '0')}`)
+  ) {
+    probe++;
+  }
+  return `LAP-${String(probe).padStart(3, '0')}`;
+}
+
+/**
+ * Deterministic 1-to-1 lookup for a student's assigned laptop across all views
+ * (Print PDF, CardPreview, CodePreviewModal, MasterView, and ScanView).
+ */
+export function getAssignedLaptopForStudent(
+  studentId: string | null | undefined,
+  laptops: Laptop[]
+): Laptop | undefined {
+  if (!studentId) return undefined;
+  return laptops.find((l) => l.assigned_student_id === studentId);
+}
+
+/**
+ * Sanitizes and self-heals the database records so that:
+ * 1. Every student has a trimmed, uppercase, 100% unique `student_code`.
+ * 2. Every laptop has a trimmed, uppercase, 100% unique `asset_code`.
+ * 3. Strict 1-to-1 Student <-> Laptop ownership: at most ONE laptop can have `assigned_student_id === student.id`.
+ *    If multiple laptops point to the same student (e.g. an auto-generated placeholder `Laptop Sekolah` and an imported real laptop),
+ *    the explicit/preferred laptop is kept and redundant auto-generated placeholder duplicates are removed or detached.
+ * 4. Dangling `assigned_student_id` references (pointing to non-existent students) are cleared to `null`.
+ */
+export function sanitizeDatabaseRecords(data: {
+  students: Student[];
+  laptops: Laptop[];
+  transactions?: Transaction[];
+}): {
+  students: Student[];
+  laptops: Laptop[];
+  nextStudentSeq: number;
+} {
+  const activeLaptopIds = new Set(
+    (data.transactions || [])
+      .filter((t) => t.status === 'active')
+      .map((t) => t.laptop_id)
+  );
+
+  // 1. Normalize & ensure unique student_code for every student
+  const seenStudentIds = new Set<string>();
+  const usedStudentCompactCodes = new Set<string>();
+  const cleanStudents: Student[] = [];
+
+  for (const rawStu of data.students) {
+    if (!rawStu || !rawStu.id || seenStudentIds.has(rawStu.id)) continue;
+    seenStudentIds.add(rawStu.id);
+
+    let code = (rawStu.student_code || '').trim().toUpperCase();
+    const compact = normalizeCodeCompact(code);
+    if (!code || usedStudentCompactCodes.has(compact)) {
+      const gen = generateNextUniqueStudentCode(cleanStudents, cleanStudents.length + 1);
+      code = gen.code;
+    }
+    usedStudentCompactCodes.add(normalizeCodeCompact(code));
+
+    cleanStudents.push({
+      ...rawStu,
+      student_code: code,
+      name: (rawStu.name || '').trim(),
+      class: (rawStu.class || '10').trim(),
+    });
+  }
+
+  const validStudentMap = new Map(cleanStudents.map((s) => [s.id, s]));
+
+  // 2. Deduplicate laptops by ID & normalize asset_code
+  const seenLaptopIds = new Set<string>();
+  const rawLaptops: Laptop[] = [];
+  for (const rawLap of data.laptops) {
+    if (!rawLap || !rawLap.id || seenLaptopIds.has(rawLap.id)) continue;
+    seenLaptopIds.add(rawLap.id);
+    const cleanAssigned =
+      rawLap.assigned_student_id && validStudentMap.has(rawLap.assigned_student_id)
+        ? rawLap.assigned_student_id
+        : null;
+    rawLaptops.push({
+      ...rawLap,
+      asset_code: (rawLap.asset_code || '').trim().toUpperCase(),
+      brand_model: (rawLap.brand_model || 'Laptop Sekolah').trim(),
+      assigned_student_id: cleanAssigned,
+    });
+  }
+
+  // 3. Enforce strict 1-to-1 Student <-> Laptop assignment
+  // If multiple laptops claim the same `assigned_student_id`, pick the single authoritative laptop for that student.
+  const laptopsByStudent = new Map<string, Laptop[]>();
+  for (const lap of rawLaptops) {
+    if (!lap.assigned_student_id) continue;
+    const list = laptopsByStudent.get(lap.assigned_student_id) || [];
+    list.push(lap);
+    laptopsByStudent.set(lap.assigned_student_id, list);
+  }
+
+  const winnerLaptopIdByStudent = new Map<string, string>();
+  const redundantAutoLaptopIdsToRemove = new Set<string>();
+
+  for (const [stuId, candidates] of laptopsByStudent.entries()) {
+    if (candidates.length === 1) {
+      winnerLaptopIdByStudent.set(stuId, candidates[0].id);
+      continue;
+    }
+    const stu = validStudentMap.get(stuId);
+    const stuNum = stu ? extractPrefixAndNumber(stu.student_code).num : null;
+
+    // Score each candidate laptop so the real/imported/active one wins deterministically
+    let bestLap = candidates[0];
+    let bestScore = -1;
+    for (let idx = 0; idx < candidates.length; idx++) {
+      const c = candidates[idx];
+      let score = idx; // Tie-breaker: later record (e.g. newly imported CSV row) wins over older placeholder
+      if (activeLaptopIds.has(c.id) || c.status === 'borrowed') score += 1000;
+      if (c.brand_model && c.brand_model.toLowerCase() !== 'laptop sekolah') score += 200;
+      const lapNum = extractPrefixAndNumber(c.asset_code).num;
+      if (stuNum !== null && lapNum !== null && stuNum === lapNum) score += 100;
+      if (score >= bestScore) {
+        bestScore = score;
+        bestLap = c;
+      }
+    }
+
+    winnerLaptopIdByStudent.set(stuId, bestLap.id);
+
+    for (const c of candidates) {
+      if (c.id !== bestLap.id) {
+        // If this loser laptop was just an auto-generated "Laptop Sekolah" with no active transaction, remove it cleanly
+        if (
+          c.brand_model.toLowerCase() === 'laptop sekolah' &&
+          !activeLaptopIds.has(c.id) &&
+          c.status === 'available'
+        ) {
+          redundantAutoLaptopIdsToRemove.add(c.id);
+        }
+      }
+    }
+  }
+
+  // 4. Rebuild laptops list with unique asset_codes and strict 1-to-1 assigned_student_id
+  const usedLaptopCompactCodes = new Set<string>();
+  const cleanLaptops: Laptop[] = [];
+
+  for (const lap of rawLaptops) {
+    if (redundantAutoLaptopIdsToRemove.has(lap.id)) continue;
+
+    let assignedStudentId = lap.assigned_student_id;
+    if (assignedStudentId && winnerLaptopIdByStudent.get(assignedStudentId) !== lap.id) {
+      assignedStudentId = null;
+    }
+
+    let assetCode = lap.asset_code;
+    const compact = normalizeCodeCompact(assetCode);
+    if (!assetCode || usedLaptopCompactCodes.has(compact)) {
+      const parsed = extractPrefixAndNumber(assetCode);
+      assetCode = generateNextUniqueLaptopCode(cleanLaptops, parsed.num);
+    }
+    usedLaptopCompactCodes.add(normalizeCodeCompact(assetCode));
+
+    cleanLaptops.push({
+      ...lap,
+      asset_code: assetCode,
+      assigned_student_id: assignedStudentId,
+    });
+  }
+
+  const nextSeqInfo = generateNextUniqueStudentCode(cleanStudents, cleanStudents.length + 1);
+
+  return {
+    students: cleanStudents,
+    laptops: cleanLaptops,
+    nextStudentSeq: nextSeqInfo.nextSeq - 1,
+  };
+}
+
+/**
+ * Splits a multi-field QR text (e.g., "SIS-0007 | Rina Putri | 12 IPS 1") into clean uppercase tokens
+ * so we never use unsafe raw substring `.includes()` where "SIS-0001" could falsely match "SIS-00010".
+ */
+function splitQrPayloadTokens(upperText: string): string[] {
+  return upperText
+    .split(/[\s|,;/()[\]"']+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+/**
  * Strictly checks if a scanned code matches a Student Card (`SIS-XXXX` or `student.student_code` or student name)
- * WITHOUT matching a Laptop Bag Tag (`LAP-XXX`). Used in Phase 1 (Scan Kartu Siswa) of the sequential scanner.
+ * WITHOUT matching a Laptop Bag Tag (`LAP-XXX`) and WITHOUT false substring matches.
+ * Used in Phase 1 (Scan Kartu Siswa) of the sequential scanner.
  */
 export function findStudentCardStrict(
   rawCode: string,
@@ -799,53 +1073,73 @@ export function findStudentCardStrict(
   const compact = normalizeCodeCompact(upper);
   const parsedScan = extractPrefixAndNumber(upper);
 
-  // Reject explicit Laptop Bag Tag prefixes in strict Student Card mode unless a student literally has that exact student_code
+  // 1. Exact student_code match (highest priority)
   const exactStudent = students.find((s) => s.student_code.trim().toUpperCase() === upper);
   if (exactStudent) return exactStudent;
 
+  // 2. Compact student_code match (e.g. "SIS0007" == "SIS-0007", but "SIS0001" !== "SIS00010")
   const compactStudent = students.find(
     (s) => normalizeCodeCompact(s.student_code) === compact
   );
   if (compactStudent) return compactStudent;
 
+  // Reject explicit Laptop Bag Tag prefixes in strict Student Card mode
   if (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS') {
     return null;
   }
 
-  // Prefix + number match for SIS-XXXX (e.g. "SIS-7", "SIS0007", "0007", "7")
+  // 3. Prefix + exact integer number match for SIS-XXXX (e.g. "SIS-7", "SIS0007", "0007", "7")
+  // Only match if the student's code also has a standard student prefix (SIS / SISWA / empty)
+  // AND there is a unique match for that number.
   if (
     parsedScan.num !== null &&
     (parsedScan.prefix === 'SIS' || parsedScan.prefix === '' || parsedScan.prefix === 'SISWA')
   ) {
-    const numMatched = students.find((s) => {
+    const numMatches = students.filter((s) => {
       const sp = extractPrefixAndNumber(s.student_code);
-      return sp.num !== null && sp.num === parsedScan.num;
+      const isCompatiblePrefix =
+        sp.prefix === 'SIS' || sp.prefix === 'SISWA' || sp.prefix === '' || sp.prefix === parsedScan.prefix;
+      return isCompatiblePrefix && sp.num !== null && sp.num === parsedScan.num;
     });
-    if (numMatched) return numMatched;
+    if (numMatches.length === 1) {
+      return numMatches[0];
+    }
   }
 
-  // Exact or compact student Name match
-  const nameMatched = students.find(
+  // 4. Exact student Name match (only if unique)
+  const nameMatches = students.filter(
     (s) =>
       s.name.trim().toUpperCase() === upper ||
       normalizeCodeCompact(s.name) === compact
   );
-  if (nameMatched) return nameMatched;
+  if (nameMatches.length === 1) {
+    return nameMatches[0];
+  }
 
-  // Substring match inside multi-field Student Card QR text (e.g., "SIS-0007 | Rina Putri")
-  const substringStudent = students.find(
-    (s) =>
-      upper.includes(s.student_code.trim().toUpperCase()) ||
-      (s.name.trim().length >= 4 && upper.includes(s.name.trim().toUpperCase()))
-  );
-  if (substringStudent) return substringStudent;
+  // 5. Token-boundary match inside multi-field Student Card QR text (e.g., "SIS-0007 | Rina Putri")
+  // Never uses raw `.includes()` on codes so "SIS-0001" will NEVER falsely match "SIS-00010".
+  const tokens = splitQrPayloadTokens(upper);
+  if (tokens.length > 1) {
+    const tokenSet = new Set(tokens);
+    const compactTokenSet = new Set(tokens.map((t) => normalizeCodeCompact(t)));
+    const tokenMatchedStudent = students.find((s) => {
+      const stuCodeUpper = s.student_code.trim().toUpperCase();
+      const stuCodeCompact = normalizeCodeCompact(stuCodeUpper);
+      return (
+        tokenSet.has(stuCodeUpper) ||
+        (stuCodeCompact.length >= 3 && compactTokenSet.has(stuCodeCompact))
+      );
+    });
+    if (tokenMatchedStudent) return tokenMatchedStudent;
+  }
 
   return null;
 }
 
 /**
  * Strictly checks if a scanned code matches a Laptop Bag Tag (`LAP-XXX` or `laptop.asset_code`)
- * WITHOUT accepting a Student Card (`SIS-XXXX`). Used in Phase 2 (Scan Gantungan Tas) of the sequential scanner.
+ * WITHOUT accepting a Student Card (`SIS-XXXX`) and WITHOUT false substring matches.
+ * Used in Phase 2 (Scan Gantungan Tas) of the sequential scanner.
  */
 export function findLaptopBagStrict(
   rawCode: string,
@@ -858,11 +1152,11 @@ export function findLaptopBagStrict(
   const compact = normalizeCodeCompact(upper);
   const parsedScan = extractPrefixAndNumber(upper);
 
-  // 1. Exact asset_code match
+  // 1. Exact asset_code match (highest priority)
   const exactLaptop = laptops.find((l) => l.asset_code.trim().toUpperCase() === upper);
   if (exactLaptop) return exactLaptop;
 
-  // 2. Compact asset_code match (e.g. "LAP007" == "LAP-007")
+  // 2. Compact asset_code match (e.g. "LAP007" == "LAP-007", but "LAP001" !== "LAP0010")
   const compactLaptop = laptops.find((l) => normalizeCodeCompact(l.asset_code) === compact);
   if (compactLaptop) return compactLaptop;
 
@@ -871,34 +1165,48 @@ export function findLaptopBagStrict(
     return null;
   }
 
-  // 3. Prefix + number match for LAP-XXX / TAS-XXX (or bare number when scanning bag tag)
+  // 3. Prefix + exact integer number match for LAP-XXX / TAS-XXX
   if (
     parsedScan.num !== null &&
     (parsedScan.prefix === 'LAP' || parsedScan.prefix === 'TAS' || parsedScan.prefix === '')
   ) {
-    if (currentScannedStudent) {
-      const ownedMatch = laptops.find((l) => {
-        const lp = extractPrefixAndNumber(l.asset_code);
-        return (
-          l.assigned_student_id === currentScannedStudent.id &&
-          lp.num !== null &&
-          lp.num === parsedScan.num
-        );
-      });
-      if (ownedMatch) return ownedMatch;
-    }
-    const numMatched = laptops.find((l) => {
+    const numCandidates = laptops.filter((l) => {
       const lp = extractPrefixAndNumber(l.asset_code);
-      return lp.num !== null && lp.num === parsedScan.num;
+      const isCompatiblePrefix =
+        lp.prefix === 'LAP' ||
+        lp.prefix === 'TAS' ||
+        lp.prefix === '' ||
+        lp.prefix === parsedScan.prefix;
+      return isCompatiblePrefix && lp.num !== null && lp.num === parsedScan.num;
     });
-    if (numMatched) return numMatched;
+
+    if (numCandidates.length === 1) {
+      return numCandidates[0];
+    }
+    if (numCandidates.length > 1 && currentScannedStudent) {
+      const ownedCandidate = numCandidates.find(
+        (l) => l.assigned_student_id === currentScannedStudent.id
+      );
+      if (ownedCandidate) return ownedCandidate;
+    }
   }
 
-  // 4. Substring match inside multi-field Bag Tag QR text (e.g., "LAP-007 | Lenovo")
-  const substringLaptop = laptops.find((l) =>
-    upper.includes(l.asset_code.trim().toUpperCase())
-  );
-  if (substringLaptop) return substringLaptop;
+  // 4. Token-boundary match inside multi-field Bag Tag QR text (e.g., "LAP-007 | Lenovo")
+  // Never uses raw `.includes()` so "LAP-001" will NEVER falsely match "LAP-0010" or "LAP-0012".
+  const tokens = splitQrPayloadTokens(upper);
+  if (tokens.length > 1) {
+    const tokenSet = new Set(tokens);
+    const compactTokenSet = new Set(tokens.map((t) => normalizeCodeCompact(t)));
+    const tokenMatchedLaptop = laptops.find((l) => {
+      const lapCodeUpper = l.asset_code.trim().toUpperCase();
+      const lapCodeCompact = normalizeCodeCompact(lapCodeUpper);
+      return (
+        tokenSet.has(lapCodeUpper) ||
+        (lapCodeCompact.length >= 3 && compactTokenSet.has(lapCodeCompact))
+      );
+    });
+    if (tokenMatchedLaptop) return tokenMatchedLaptop;
+  }
 
   return null;
 }

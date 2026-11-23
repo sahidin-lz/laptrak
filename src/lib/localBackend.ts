@@ -26,8 +26,11 @@ import { ApiError, AuthStatusResponse, BorrowPayload, LoginResponse } from './ap
 import {
   extractPrefixAndNumber,
   findStudentByScannedCode,
+  generateNextUniqueLaptopCode,
+  generateNextUniqueStudentCode,
   normalizeCodeCompact,
   parseBimbelDays,
+  sanitizeDatabaseRecords,
   validateDailySessionSelection,
   validateStudentBimbelSchedule,
 } from './store';
@@ -488,6 +491,15 @@ function loadLocalDb(): LocalDatabase {
     if (raw) {
       const parsed = JSON.parse(raw) as LocalDatabase;
       if (parsed && Array.isArray(parsed.students) && Array.isArray(parsed.laptops)) {
+        const sanitized = sanitizeDatabaseRecords({
+          students: parsed.students,
+          laptops: parsed.laptops,
+          transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
+        });
+        parsed.students = sanitized.students;
+        parsed.laptops = sanitized.laptops;
+        parsed.studentSeq = Math.max(parsed.studentSeq || 1, sanitized.nextStudentSeq);
+
         // If this device already has uploaded data (> 6 default items) from before updatedAtMs was added,
         // stamp it with a non-zero timestamp so it is automatically pushed to Firebase Firestore!
         if (!parsed.updatedAtMs && (parsed.laptops.length > 6 || parsed.students.length > 6)) {
@@ -557,6 +569,15 @@ function refreshExpiredSuspensions(students: Student[]): void {
 }
 
 function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
+  const preSanitized = sanitizeDatabaseRecords({
+    students: db.students,
+    laptops: db.laptops,
+    transactions: db.transactions,
+  });
+  db.students = preSanitized.students;
+  db.laptops = preSanitized.laptops;
+  db.studentSeq = Math.max(db.studentSeq || 1, preSanitized.nextStudentSeq);
+
   const assignedStudentIds = new Set(
     db.laptops.map((l) => l.assigned_student_id).filter(Boolean) as string[]
   );
@@ -576,6 +597,7 @@ function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
       (l) =>
         !l.assigned_student_id &&
         (l.asset_code.toUpperCase() === desiredLapCode.toUpperCase() ||
+          normalizeCodeCompact(l.asset_code) === normalizeCodeCompact(desiredLapCode) ||
           (parsedStu.num !== null &&
             extractPrefixAndNumber(l.asset_code).num === parsedStu.num))
     );
@@ -586,32 +608,11 @@ function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
       continue;
     }
 
-    // 2. If desiredLapCode does not exist at all, create it automatically for this student
-    if (!db.laptops.some((l) => l.asset_code.toUpperCase() === desiredLapCode.toUpperCase())) {
-      db.laptops.push({
-        id: makeId('lap'),
-        asset_code: desiredLapCode.toUpperCase(),
-        brand_model: 'Laptop Sekolah',
-        status: 'available',
-        assigned_student_id: st.id,
-        created_at: nowIso,
-      });
-      assignedStudentIds.add(st.id);
-      continue;
-    }
-
-    // 3. Otherwise generate next available LAP-XXX code
-    let nextNum = Math.max(db.laptops.length + 1, parsedStu.num || 1);
-    while (
-      db.laptops.some(
-        (l) => l.asset_code.toUpperCase() === `LAP-${String(nextNum).padStart(3, '0')}`
-      )
-    ) {
-      nextNum++;
-    }
+    // 2. Otherwise generate guaranteed-unique LAP-XXX code (preferring student's sequence number if free)
+    const uniqueAssetCode = generateNextUniqueLaptopCode(db.laptops, parsedStu.num);
     db.laptops.push({
       id: makeId('lap'),
-      asset_code: `LAP-${String(nextNum).padStart(3, '0')}`,
+      asset_code: uniqueAssetCode,
       brand_model: 'Laptop Sekolah',
       status: 'available',
       assigned_student_id: st.id,
@@ -622,6 +623,15 @@ function ensureStudentsHaveLaptopAllocation(db: LocalDatabase): void {
 }
 
 function buildAppState(touchModified = true): AppStatePayload {
+  const sanitized = sanitizeDatabaseRecords({
+    students: localDb.students,
+    laptops: localDb.laptops,
+    transactions: localDb.transactions,
+  });
+  localDb.students = sanitized.students;
+  localDb.laptops = sanitized.laptops;
+  localDb.studentSeq = Math.max(localDb.studentSeq || 1, sanitized.nextStudentSeq);
+
   refreshExpiredSuspensions(localDb.students);
 
   if (touchModified) {
@@ -667,12 +677,17 @@ function buildAppState(touchModified = true): AppStatePayload {
  */
 export function mirrorStateToLocalDb(state: Partial<AppStatePayload> | null | undefined): void {
   if (!state || !Array.isArray(state.students) || !Array.isArray(state.laptops)) return;
-  localDb.students = [...state.students];
-  localDb.studentSeq = Math.max(localDb.studentSeq, localDb.students.length + 1);
-  localDb.laptops = [...state.laptops];
   if (Array.isArray(state.transactions)) {
     localDb.transactions = [...state.transactions];
   }
+  const sanitized = sanitizeDatabaseRecords({
+    students: state.students,
+    laptops: state.laptops,
+    transactions: localDb.transactions,
+  });
+  localDb.students = sanitized.students;
+  localDb.laptops = sanitized.laptops;
+  localDb.studentSeq = Math.max(localDb.studentSeq, sanitized.nextStudentSeq);
   if (Array.isArray(state.schedules)) {
     localDb.schedules = [...state.schedules];
   }
@@ -1328,9 +1343,11 @@ export const localBackend = {
     photo_url: string | null;
     bimbel_days?: string[];
   }) => {
+    const genCode = generateNextUniqueStudentCode(localDb.students, localDb.studentSeq);
+    localDb.studentSeq = genCode.nextSeq;
     const created: Student = {
       id: makeId('stu'),
-      student_code: formatStudentCode(localDb.studentSeq++),
+      student_code: genCode.code,
       name: payload.name.trim(),
       class: payload.class.trim(),
       wilayah: normalizeWilayah(payload.wilayah, 'putra'),
@@ -1401,7 +1418,9 @@ export const localBackend = {
       // Check if student already exists by student_code or exact name
       let student = localDb.students.find(
         (s) =>
-          (customCode && s.student_code.toUpperCase() === customCode) ||
+          (customCode &&
+            (s.student_code.toUpperCase() === customCode ||
+              normalizeCodeCompact(s.student_code) === normalizeCodeCompact(customCode))) ||
           (s.name.trim().toLowerCase() === cleanName.toLowerCase() &&
             s.class.trim().toLowerCase() === cleanClass.toLowerCase())
       );
@@ -1410,12 +1429,31 @@ export const localBackend = {
         student.name = cleanName;
         student.class = cleanClass;
         student.wilayah = cleanWilayah;
-        if (customCode) student.student_code = customCode;
+        if (
+          customCode &&
+          !localDb.students.some(
+            (other) =>
+              other.id !== student!.id &&
+              normalizeCodeCompact(other.student_code) === normalizeCodeCompact(customCode)
+          )
+        ) {
+          student.student_code = customCode;
+        }
         if (raw.photo_url) student.photo_url = raw.photo_url;
         if (raw.bimbel_days !== undefined) student.bimbel_days = parsedBimbel;
         createdStudents++;
       } else {
-        const nextCode = customCode || formatStudentCode(localDb.studentSeq++);
+        let nextCode = customCode;
+        if (
+          !nextCode ||
+          localDb.students.some(
+            (s) => normalizeCodeCompact(s.student_code) === normalizeCodeCompact(nextCode!)
+          )
+        ) {
+          const gen = generateNextUniqueStudentCode(localDb.students, localDb.studentSeq);
+          nextCode = gen.code;
+          localDb.studentSeq = gen.nextSeq;
+        }
         student = {
           id: makeId('stu'),
           student_code: nextCode,
@@ -1594,9 +1632,11 @@ export const localBackend = {
 
         // If ref looks like a student name that isn't registered yet, auto-create the student!
         if (!matchedStudent && !/^SIS[-_]?\d+$/i.test(ref) && ref.length >= 2) {
+          const gen = generateNextUniqueStudentCode(localDb.students, localDb.studentSeq);
+          localDb.studentSeq = gen.nextSeq;
           const newStu: Student = {
             id: makeId('stu'),
-            student_code: formatStudentCode(localDb.studentSeq++),
+            student_code: gen.code,
             name: ref,
             class: '10',
             wilayah: 'putra',
