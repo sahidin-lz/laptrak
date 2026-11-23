@@ -100,6 +100,10 @@ interface MasterViewProps {
   onBulkAddStudents: (
     rows: ParsedStudentLaptopRow[]
   ) => Promise<{ ok: boolean; createdStudents?: number; createdLaptops?: number; error?: string }>;
+  onBulkSwitchStudentsWilayah: (payload: {
+    targetWilayah: Wilayah;
+    studentIds?: string[];
+  }) => Promise<{ ok: boolean; updatedCount?: number; error?: string }>;
   onSuspendStudent: (
     studentId: string,
     payload: { suspended_until: string; reason: string }
@@ -185,6 +189,7 @@ export function MasterView({
   onAddStudent,
   onUpdateStudent,
   onBulkAddStudents,
+  onBulkSwitchStudentsWilayah,
   onSuspendStudent,
   onResetSanction,
   onDeleteStudent,
@@ -210,6 +215,7 @@ export function MasterView({
   );
   const [search, setSearch] = useState('');
   const [wilayahFilter, setWilayahFilter] = useState<'ALL' | Wilayah>('ALL');
+  const [uploadTargetWilayah, setUploadTargetWilayah] = useState<'OTOMATIS' | Wilayah>('putri');
   const [formMsg, setFormMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -452,7 +458,16 @@ export function MasterView({
     setFormMsg(null);
     try {
       const text = await readSpreadsheetFileToText(file);
-      const rows = parseStudentCsv(text);
+      const defaultWilayah: Wilayah =
+        uploadTargetWilayah === 'OTOMATIS'
+          ? wilayahFilter === 'putri'
+            ? 'putri'
+            : 'putra'
+          : uploadTargetWilayah;
+      let rows = parseStudentCsv(text, defaultWilayah);
+      if (uploadTargetWilayah !== 'OTOMATIS') {
+        rows = rows.map((r) => ({ ...r, wilayah: uploadTargetWilayah }));
+      }
       if (rows.length === 0) {
         setFormMsg({
           type: 'err',
@@ -461,9 +476,16 @@ export function MasterView({
       } else {
         const res = await onBulkAddStudents(rows);
         if (res.ok) {
+          if (uploadTargetWilayah !== 'OTOMATIS') {
+            setWilayahFilter(uploadTargetWilayah);
+          }
           setFormMsg({
             type: 'ok',
-            text: `${res.createdStudents} siswa (kode SIS-XXXX otomatis) dan ${res.createdLaptops} unit laptop berhasil diimpor dari template Excel/CSV.`,
+            text: `${res.createdStudents} siswa (${
+              uploadTargetWilayah === 'OTOMATIS'
+                ? 'sesuai kolom wilayah'
+                : WILAYAH_LABELS[uploadTargetWilayah]
+            }) dan ${res.createdLaptops} unit laptop berhasil diimpor dari template Excel/CSV.`,
           });
         } else {
           setFormMsg({ type: 'err', text: res.error || 'Gagal impor data siswa.' });
@@ -473,6 +495,34 @@ export function MasterView({
       setFormMsg({ type: 'err', text: 'Gagal membaca file Excel/CSV siswa.' });
     } finally {
       e.target.value = '';
+      setSubmitting(false);
+    }
+  };
+
+  const handleQuickMoveStudentsWilayah = async (
+    targetWilayah: Wilayah,
+    studentIds?: string[],
+    labelDesc?: string
+  ) => {
+    setSubmitting(true);
+    setFormMsg(null);
+    try {
+      const res = await onBulkSwitchStudentsWilayah({ targetWilayah, studentIds });
+      if (res.ok) {
+        setWilayahFilter(targetWilayah);
+        setFormMsg({
+          type: 'ok',
+          text: `Berhasil memindahkan ${res.updatedCount ?? 0} data siswa ${
+            labelDesc || ''
+          } ke ${WILAYAH_LABELS[targetWilayah]}!`,
+        });
+      } else {
+        setFormMsg({
+          type: 'err',
+          text: res.error || 'Gagal memindahkan wilayah siswa.',
+        });
+      }
+    } finally {
       setSubmitting(false);
     }
   };
@@ -531,11 +581,11 @@ export function MasterView({
     setSubmitting(false);
   };
 
-  const laptopTemplateHeaders = ['kode_laptop', 'merk_laptop', 'kode_siswa'];
+  const laptopTemplateHeaders = ['kode_laptop', 'merk_laptop', 'kode_siswa', 'wilayah'];
   const laptopTemplateRows = [
-    ['LAP-007', 'Lenovo ThinkPad T480', 'SIS-0001'],
-    ['LAP-008', 'Asus Vivobook 14', 'SIS-0002'],
-    ['LAP-009', 'Acer TravelMate P2', ''],
+    ['LAP-007', 'Lenovo ThinkPad T480', 'SIS-0001', 'putra'],
+    ['LAP-008', 'Asus Vivobook 14', 'SIS-0002', 'putri'],
+    ['LAP-009', 'Acer TravelMate P2', 'Zahra Aulia', 'putri'],
   ];
 
   const handleDownloadLaptopExcelTemplate = () => {
@@ -544,7 +594,7 @@ export function MasterView({
       'Template Unit Laptop',
       laptopTemplateHeaders,
       laptopTemplateRows,
-      [18, 28, 18]
+      [18, 28, 22, 16]
     );
   };
 
@@ -563,7 +613,16 @@ export function MasterView({
     setFormMsg(null);
     try {
       const text = await readSpreadsheetFileToText(file);
-      const rows = parseLaptopCsv(text);
+      const defaultWilayah: Wilayah =
+        uploadTargetWilayah === 'OTOMATIS'
+          ? wilayahFilter === 'putri'
+            ? 'putri'
+            : 'putra'
+          : uploadTargetWilayah;
+      let rows = parseLaptopCsv(text, defaultWilayah);
+      if (uploadTargetWilayah !== 'OTOMATIS') {
+        rows = rows.map((r) => ({ ...r, wilayah: uploadTargetWilayah }));
+      }
       if (rows.length === 0) {
         setFormMsg({
           type: 'err',
@@ -572,9 +631,16 @@ export function MasterView({
       } else {
         const res = await onBulkAddLaptops(rows);
         if (res.ok) {
+          if (uploadTargetWilayah !== 'OTOMATIS') {
+            setWilayahFilter(uploadTargetWilayah);
+          }
           setFormMsg({
             type: 'ok',
-            text: `Berhasil mengimpor Template Laptop: ${res.createdLaptops} unit baru ditambahkan, ${res.updatedLaptops} unit diperbarui.`,
+            text: `Berhasil mengimpor Template Laptop (${
+              uploadTargetWilayah === 'OTOMATIS'
+                ? 'Sesuai Kolom Wilayah'
+                : WILAYAH_LABELS[uploadTargetWilayah]
+            }): ${res.createdLaptops} unit baru ditambahkan, ${res.updatedLaptops} unit diperbarui.`,
           });
         } else {
           setFormMsg({ type: 'err', text: res.error || 'Gagal impor file laptop.' });
@@ -944,7 +1010,39 @@ export function MasterView({
                 </table>
               </div>
 
-              <div className="mt-3.5 space-y-2">
+              <div className="mt-3.5 space-y-2.5">
+                <div className="rounded-xl border border-emerald-200 bg-white p-2.5">
+                  <label className="mb-1.5 block text-[11px] font-extrabold text-emerald-950">
+                    Target Wilayah Saat Upload File Ini:
+                  </label>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(
+                      [
+                        { id: 'putri', label: 'Wilayah Putri' },
+                        { id: 'putra', label: 'Wilayah Putra' },
+                        { id: 'OTOMATIS', label: 'Ikuti Kolom File' },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setUploadTargetWilayah(opt.id)}
+                        className={`rounded-lg px-2 py-1.5 text-[11px] font-extrabold transition-colors ${
+                          uploadTargetWilayah === opt.id
+                            ? opt.id === 'putri'
+                              ? 'bg-fuchsia-700 text-white shadow-2xs'
+                              : opt.id === 'putra'
+                              ? 'bg-sky-700 text-white shadow-2xs'
+                              : 'bg-emerald-700 text-white shadow-2xs'
+                            : 'border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
@@ -1142,9 +1240,44 @@ export function MasterView({
           <div className="lg:col-span-8">
             <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
               <div className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-                <h3 className="text-sm font-extrabold text-slate-900">
-                  Daftar Siswa ({filteredStudents.length}) — Lengkap dengan Edit, Suspend &amp; Hapus
-                </h3>
+                <div>
+                  <h3 className="text-sm font-extrabold text-slate-900">
+                    Daftar Siswa ({filteredStudents.length}) — Lengkap dengan Edit, Suspend &amp; Hapus
+                  </h3>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-bold text-slate-500">
+                      Perbaiki Wilayah Massal ({filteredStudents.length} siswa tampil):
+                    </span>
+                    <button
+                      type="button"
+                      disabled={submitting || filteredStudents.length === 0}
+                      onClick={() =>
+                        handleQuickMoveStudentsWilayah(
+                          'putri',
+                          filteredStudents.map((s) => s.id),
+                          'yang ditampilkan'
+                        )
+                      }
+                      className="inline-flex items-center gap-1 rounded-lg border border-fuchsia-200 bg-fuchsia-50 px-2.5 py-1 text-[11px] font-extrabold text-fuchsia-800 transition-colors hover:bg-fuchsia-100 disabled:opacity-50"
+                    >
+                      Pindahkan ke Wilayah Putri
+                    </button>
+                    <button
+                      type="button"
+                      disabled={submitting || filteredStudents.length === 0}
+                      onClick={() =>
+                        handleQuickMoveStudentsWilayah(
+                          'putra',
+                          filteredStudents.map((s) => s.id),
+                          'yang ditampilkan'
+                        )
+                      }
+                      className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-extrabold text-sky-800 transition-colors hover:bg-sky-100 disabled:opacity-50"
+                    >
+                      Pindahkan ke Wilayah Putra
+                    </button>
+                  </div>
+                </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <select
                     value={wilayahFilter}
@@ -1369,7 +1502,39 @@ export function MasterView({
                 </table>
               </div>
 
-              <div className="mt-3.5 space-y-2">
+              <div className="mt-3.5 space-y-2.5">
+                <div className="rounded-xl border border-blue-200 bg-white p-2.5">
+                  <label className="mb-1.5 block text-[11px] font-extrabold text-blue-950">
+                    Target Wilayah Pemilik Siswa Saat Upload File Ini:
+                  </label>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(
+                      [
+                        { id: 'putri', label: 'Wilayah Putri' },
+                        { id: 'putra', label: 'Wilayah Putra' },
+                        { id: 'OTOMATIS', label: 'Ikuti Kolom File' },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setUploadTargetWilayah(opt.id)}
+                        className={`rounded-lg px-2 py-1.5 text-[11px] font-extrabold transition-colors ${
+                          uploadTargetWilayah === opt.id
+                            ? opt.id === 'putri'
+                              ? 'bg-fuchsia-700 text-white shadow-2xs'
+                              : opt.id === 'putra'
+                              ? 'bg-sky-700 text-white shadow-2xs'
+                              : 'bg-blue-700 text-white shadow-2xs'
+                            : 'border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
@@ -1497,9 +1662,48 @@ export function MasterView({
           <div className="lg:col-span-8">
             <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
               <div className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-                <h3 className="text-sm font-extrabold text-slate-900">
-                  Inventaris Unit Laptop &amp; Gantungan Tas ({filteredLaptops.length})
-                </h3>
+                <div>
+                  <h3 className="text-sm font-extrabold text-slate-900">
+                    Inventaris Unit Laptop &amp; Gantungan Tas ({filteredLaptops.length})
+                  </h3>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-bold text-slate-500">
+                      Perbaiki Wilayah Pemilik ({filteredLaptops.length} unit tampil):
+                    </span>
+                    <button
+                      type="button"
+                      disabled={submitting || filteredLaptops.length === 0}
+                      onClick={() =>
+                        handleQuickMoveStudentsWilayah(
+                          'putri',
+                          filteredLaptops
+                            .map((l) => l.assigned_student_id)
+                            .filter(Boolean) as string[],
+                          'pemilik laptop yang ditampilkan'
+                        )
+                      }
+                      className="inline-flex items-center gap-1 rounded-lg border border-fuchsia-200 bg-fuchsia-50 px-2.5 py-1 text-[11px] font-extrabold text-fuchsia-800 transition-colors hover:bg-fuchsia-100 disabled:opacity-50"
+                    >
+                      Pindahkan ke Wilayah Putri
+                    </button>
+                    <button
+                      type="button"
+                      disabled={submitting || filteredLaptops.length === 0}
+                      onClick={() =>
+                        handleQuickMoveStudentsWilayah(
+                          'putra',
+                          filteredLaptops
+                            .map((l) => l.assigned_student_id)
+                            .filter(Boolean) as string[],
+                          'pemilik laptop yang ditampilkan'
+                        )
+                      }
+                      className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-extrabold text-sky-800 transition-colors hover:bg-sky-100 disabled:opacity-50"
+                    >
+                      Pindahkan ke Wilayah Putra
+                    </button>
+                  </div>
+                </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <select
                     value={wilayahFilter}

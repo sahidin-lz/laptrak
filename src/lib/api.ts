@@ -417,11 +417,29 @@ export const api = {
       () => localBackend.updateLaptop(laptopId, payload)
     ),
 
+  bulkSwitchStudentsWilayah: (payload: {
+    targetWilayah: Wilayah;
+    studentIds?: string[];
+  }) =>
+    requestWithFallback<{
+      updatedCount: number;
+      state: AppStatePayload;
+    }>(
+      '/api/students/bulk-wilayah',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      () => localBackend.bulkSwitchStudentsWilayah(payload)
+    ),
+
   bulkAddLaptops: (
     rows: Array<{
       asset_code: string;
       brand_model: string;
       student_code?: string;
+      wilayah?: Wilayah;
+      class?: string;
     }>
   ) =>
     requestWithFallback<{

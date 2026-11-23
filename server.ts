@@ -203,8 +203,45 @@ function sanitizePhotoUrl(raw: unknown): string | null {
 function normalizeWilayah(raw: unknown, fallback: Wilayah = 'putra'): Wilayah {
   if (typeof raw !== 'string') return fallback;
   const v = raw.trim().toLowerCase();
-  if (v === 'putri' || v === 'pr' || v === 'perempuan' || v === 'p') return 'putri';
-  if (v === 'putra' || v === 'lk' || v === 'laki-laki' || v === 'l') return 'putra';
+  if (!v) return fallback;
+  if (
+    v === 'putri' ||
+    v === 'pr' ||
+    v === 'perempuan' ||
+    v === 'p' ||
+    v === 'pi' ||
+    v === 'w' ||
+    v === 'wanita' ||
+    v === 'akhwat' ||
+    v === 'banat' ||
+    v === 'female' ||
+    v === 'f' ||
+    v.includes('putri') ||
+    v.includes('perempuan') ||
+    v.includes('banat') ||
+    v.includes('akhwat')
+  ) {
+    return 'putri';
+  }
+  if (
+    v === 'putra' ||
+    v === 'lk' ||
+    v === 'laki-laki' ||
+    v === 'laki' ||
+    v === 'l' ||
+    v === 'pa' ||
+    v === 'pria' ||
+    v === 'ikhwan' ||
+    v === 'banin' ||
+    v === 'male' ||
+    v === 'm' ||
+    v.includes('putra') ||
+    v.includes('laki') ||
+    v.includes('banin') ||
+    v.includes('ikhwan')
+  ) {
+    return 'putra';
+  }
   return fallback;
 }
 
@@ -1969,6 +2006,24 @@ async function startServer() {
     }
   );
 
+  app.post('/api/students/bulk-wilayah', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const targetWilayah = normalizeWilayah(req.body?.targetWilayah, 'putri');
+    const studentIds = Array.isArray(req.body?.studentIds) ? req.body.studentIds : [];
+    const idSet = studentIds.length > 0 ? new Set(studentIds) : null;
+    let updatedCount = 0;
+    for (const s of db.students) {
+      if (idSet && !idSet.has(s.id)) continue;
+      if (s.wilayah !== targetWilayah) {
+        s.wilayah = targetWilayah;
+        updatedCount++;
+      }
+    }
+    res.json({
+      updatedCount,
+      state: buildStateForRole('admin'),
+    });
+  });
+
   app.delete('/api/students/:id', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
     const id = req.params.id;
     db.students = db.students.filter((s) => s.id !== id);
@@ -2081,12 +2136,21 @@ async function startServer() {
           : 'Laptop Sekolah';
       const studentRef =
         typeof raw?.student_code === 'string' ? raw.student_code.trim() : '';
+      const targetWilayah = normalizeWilayah(raw?.wilayah, 'putra');
+      const targetClass =
+        typeof raw?.class === 'string' && raw.class.trim() ? raw.class.trim().slice(0, 40) : '10';
 
       if (!assetCode) continue;
 
       let matchedStudent: Student | null = null;
       if (studentRef) {
         matchedStudent = findStudentByScannedCode(studentRef, db.students, db.laptops);
+        if (matchedStudent && raw?.wilayah) {
+          matchedStudent.wilayah = targetWilayah;
+          if (typeof raw?.class === 'string' && raw.class.trim()) {
+            matchedStudent.class = targetClass;
+          }
+        }
         if (!matchedStudent && !/^SIS[-_]?\d+$/i.test(studentRef) && studentRef.length >= 2) {
           const gen = generateNextUniqueStudentCode(db.students, db.studentSeq);
           db.studentSeq = gen.nextSeq;
@@ -2094,8 +2158,8 @@ async function startServer() {
             id: makeId('stu'),
             student_code: gen.code,
             name: studentRef.slice(0, 120),
-            class: '10',
-            wilayah: 'putra',
+            class: targetClass,
+            wilayah: targetWilayah,
             photo_url: null,
             late_count: 0,
             is_suspended: false,

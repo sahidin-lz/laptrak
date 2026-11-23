@@ -310,6 +310,8 @@ export interface ParsedLaptopOnlyRow {
   asset_code: string;
   brand_model: string;
   student_code?: string;
+  wilayah?: Wilayah;
+  class?: string;
 }
 
 export type ParsedLaptopCsvRow = ParsedLaptopOnlyRow;
@@ -402,7 +404,7 @@ export async function readSpreadsheetFileToText(file: File): Promise<string> {
       defval: '',
       raw: false,
     });
-    return aoa
+    const textLines = aoa
       .map((row: unknown[]) =>
         (Array.isArray(row) ? row : [])
           .map((cell: unknown) =>
@@ -412,11 +414,28 @@ export async function readSpreadsheetFileToText(file: File): Promise<string> {
           )
           .join('\t')
       )
-      .filter((line: string) => line.replace(/\t/g, '').trim().length > 0)
-      .join('\n');
+      .filter((line: string) => line.replace(/\t/g, '').trim().length > 0);
+
+    // If the Excel sheet name or filename explicitly mentions Putri/Putra, prepend a metadata hint
+    // so parsers know the intended wilayah if no explicit wilayah column exists
+    const combinedContext = `${file.name} ${firstSheetName}`.toLowerCase();
+    if (/\b(putri|banat|akhwat|perempuan|wanita)\b/.test(combinedContext)) {
+      return `#WILAYAH_HINT=putri\n${textLines.join('\n')}`;
+    }
+    if (/\b(putra|banin|ikhwan|laki)\b/.test(combinedContext)) {
+      return `#WILAYAH_HINT=putra\n${textLines.join('\n')}`;
+    }
+    return textLines.join('\n');
   }
 
-  return await file.text();
+  const rawText = await file.text();
+  if (/\b(putri|banat|akhwat|perempuan|wanita)\b/i.test(file.name)) {
+    return `#WILAYAH_HINT=putri\n${rawText}`;
+  }
+  if (/\b(putra|banin|ikhwan|laki)\b/i.test(file.name)) {
+    return `#WILAYAH_HINT=putra\n${rawText}`;
+  }
+  return rawText;
 }
 
 function splitCsvLine(line: string): string[] {
@@ -470,17 +489,90 @@ function normalizeCsvLines(text: string): string[] {
     .filter((line) => Boolean(line) && !/^sep=.$/i.test(line));
 }
 
-function parseWilayahCol(raw: string | undefined): Wilayah {
+export function parseWilayahCol(
+  raw: string | undefined,
+  fallback: Wilayah = 'putra'
+): Wilayah {
   const v = (raw || '').trim().toLowerCase();
-  if (v === 'putri' || v === 'pr' || v === 'perempuan' || v === 'p') return 'putri';
-  return 'putra';
+  if (!v) return fallback;
+  if (
+    v === 'putri' ||
+    v === 'pr' ||
+    v === 'perempuan' ||
+    v === 'p' ||
+    v === 'pi' ||
+    v === 'w' ||
+    v === 'wanita' ||
+    v === 'akhwat' ||
+    v === 'banat' ||
+    v === 'female' ||
+    v === 'f' ||
+    v.includes('putri') ||
+    v.includes('perempuan') ||
+    v.includes('banat') ||
+    v.includes('akhwat')
+  ) {
+    return 'putri';
+  }
+  if (
+    v === 'putra' ||
+    v === 'lk' ||
+    v === 'laki-laki' ||
+    v === 'laki' ||
+    v === 'l' ||
+    v === 'pa' ||
+    v === 'pria' ||
+    v === 'ikhwan' ||
+    v === 'banin' ||
+    v === 'male' ||
+    v === 'm' ||
+    v.includes('putra') ||
+    v.includes('laki') ||
+    v.includes('banin') ||
+    v.includes('ikhwan')
+  ) {
+    return 'putra';
+  }
+  return fallback;
 }
 
 function parseStaffWilayahCol(raw: string | undefined): StaffWilayah {
   const v = (raw || '').trim().toLowerCase();
-  if (v === 'putri' || v === 'pr' || v === 'perempuan') return 'putri';
-  if (v === 'semua' || v === 'all') return 'semua';
+  if (v === 'semua' || v === 'all' || (v.includes('putra') && v.includes('putri'))) {
+    return 'semua';
+  }
+  if (
+    v === 'putri' ||
+    v === 'pr' ||
+    v === 'perempuan' ||
+    v === 'p' ||
+    v === 'pi' ||
+    v.includes('putri') ||
+    v.includes('perempuan')
+  ) {
+    return 'putri';
+  }
   return 'putra';
+}
+
+function extractWilayahHintAndLines(
+  text: string,
+  defaultWilayah: Wilayah = 'putra'
+): { lines: string[]; fallbackWilayah: Wilayah } {
+  const allLines = normalizeCsvLines(text);
+  let fallbackWilayah: Wilayah = defaultWilayah;
+  const filteredLines: string[] = [];
+  for (const line of allLines) {
+    if (line.startsWith('#WILAYAH_HINT=')) {
+      const val = line.replace('#WILAYAH_HINT=', '').trim();
+      if (val === 'putri' || val === 'putra') {
+        fallbackWilayah = val;
+      }
+      continue;
+    }
+    filteredLines.push(line);
+  }
+  return { lines: filteredLines, fallbackWilayah };
 }
 
 /**
@@ -488,8 +580,11 @@ function parseStaffWilayahCol(raw: string | undefined): StaffWilayah {
  * Supports optional `no`, `kode_siswa`, `jadwal_bimbel`, and any column ordering:
  * e.g. nama | kelas | wilayah | kode_laptop | merk_laptop | jadwal_bimbel | photo_url
  */
-export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
-  const lines = normalizeCsvLines(text);
+export function parseStudentCsv(
+  text: string,
+  defaultWilayah: Wilayah = 'putra'
+): ParsedStudentLaptopRow[] {
+  const { lines, fallbackWilayah } = extractWilayahHintAndLines(text, defaultWilayah);
   if (lines.length === 0) return [];
 
   const firstRowCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase().trim());
@@ -501,7 +596,9 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
       c.includes('nama') ||
       c.includes('kelas') ||
       c.includes('laptop') ||
-      c.includes('bimbel')
+      c.includes('bimbel') ||
+      c.includes('wilayah') ||
+      c.includes('kelamin')
   );
 
   const dataLines = isHeaderRow ? lines.slice(1) : lines;
@@ -521,7 +618,10 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
   ]);
   const idxName = findColIdx([/^(nama|nama_siswa|nama_lengkap|name|siswa|murid)$/, /nama/]);
   const idxClass = findColIdx([/^(kelas|class|rombel|tingkat)$/, /kelas/]);
-  const idxWilayah = findColIdx([/^(wilayah|asrama|gender|jk|jenis_kelamin|putra_putri)$/, /wilayah/]);
+  const idxWilayah = findColIdx([
+    /^(wilayah|asrama|gender|jk|jenis_kelamin|putra_putri|kategori|rayon|gedung|kelompok)$/,
+    /wilayah|asrama|kelamin|gender|jk|putra|putri/,
+  ]);
   const idxLaptopCode = findColIdx([
     /^(kode_laptop|asset_code|barcode_tas|kode_tas|barcode_laptop|kode_barcode|nomor_laptop)$/,
     /kode.*laptop|barcode.*tas/,
@@ -547,7 +647,14 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
       if (isHeaderRow && idxName !== -1) {
         const nama = (cols[idxName] || '').trim();
         const kelas = idxClass !== -1 ? (cols[idxClass] || '').trim() : '10';
-        const wilayahRaw = idxWilayah !== -1 ? cols[idxWilayah] : 'putra';
+        const wilayahRaw = idxWilayah !== -1 ? cols[idxWilayah] : '';
+        // Also check if kelas or any column explicitly mentions putri/putra when idxWilayah is missing
+        const inferredFromClass =
+          !wilayahRaw && /\b(putri|banat|akhwat|pi)\b/i.test(kelas)
+            ? 'putri'
+            : !wilayahRaw && /\b(putra|banin|ikhwan|pa)\b/i.test(kelas)
+            ? 'putra'
+            : '';
         const studentCodeRaw = idxStudentCode !== -1 ? (cols[idxStudentCode] || '').trim() : '';
         const kodeLaptopRaw = idxLaptopCode !== -1 ? (cols[idxLaptopCode] || '').trim() : '';
         const merkLaptopRaw = idxLaptopBrand !== -1 ? (cols[idxLaptopBrand] || '').trim() : '';
@@ -558,7 +665,7 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
           student_code: studentCodeRaw ? studentCodeRaw.toUpperCase() : undefined,
           name: nama,
           class: kelas || '10',
-          wilayah: parseWilayahCol(wilayahRaw),
+          wilayah: parseWilayahCol(wilayahRaw || inferredFromClass, fallbackWilayah),
           laptop_code: kodeLaptopRaw ? kodeLaptopRaw.toUpperCase() : undefined,
           laptop_brand: merkLaptopRaw || undefined,
           bimbel_days: parseBimbelDays(bimbelRaw),
@@ -575,7 +682,7 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
           student_code: c0.toUpperCase(),
           name: c1,
           class: c2 || '10',
-          wilayah: parseWilayahCol(c3),
+          wilayah: parseWilayahCol(c3, fallbackWilayah),
           laptop_code: c4 ? c4.toUpperCase() : undefined,
           laptop_brand: c5 || undefined,
           bimbel_days: parsedDays.length > 0 ? parsedDays : undefined,
@@ -589,7 +696,7 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
       return {
         name: c0 || '',
         class: c1 || '10',
-        wilayah: parseWilayahCol(c2),
+        wilayah: parseWilayahCol(c2, fallbackWilayah),
         laptop_code: c3 ? c3.toUpperCase() : undefined,
         laptop_brand: c4 || undefined,
         bimbel_days: isC5Bimbel ? c5Days : undefined,
@@ -601,10 +708,13 @@ export function parseStudentCsv(text: string): ParsedStudentLaptopRow[] {
 
 /**
  * Header-aware & fallback parser for Laptop-only CSV/Excel template:
- * Kolom: kode_laptop | merk_laptop | kode_siswa
+ * Kolom: kode_laptop | merk_laptop | kode_siswa | wilayah (opsional) | kelas (opsional)
  */
-export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
-  const lines = normalizeCsvLines(text);
+export function parseLaptopCsv(
+  text: string,
+  defaultWilayah: Wilayah = 'putra'
+): ParsedLaptopOnlyRow[] {
+  const { lines, fallbackWilayah } = extractWilayahHintAndLines(text, defaultWilayah);
   if (lines.length === 0) return [];
 
   const firstRowCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase().trim());
@@ -615,7 +725,8 @@ export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
       c.includes('merk') ||
       c.includes('brand') ||
       c.includes('siswa') ||
-      c.includes('nama')
+      c.includes('nama') ||
+      c.includes('wilayah')
   );
 
   const dataLines = isHeaderRow ? lines.slice(1) : lines;
@@ -641,6 +752,11 @@ export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
     /^(kode_siswa|student_code|nama_siswa|nama|pemilik|siswa)$/,
     /siswa|nama|pemilik/,
   ]);
+  const idxWilayah = findColIdx([
+    /^(wilayah|asrama|gender|jk|jenis_kelamin|putra_putri|kategori|rayon)$/,
+    /wilayah|asrama|kelamin|gender|jk|putra|putri/,
+  ]);
+  const idxClass = findColIdx([/^(kelas|class|rombel|tingkat)$/, /kelas/]);
 
   return dataLines
     .map((line) => {
@@ -653,18 +769,24 @@ export function parseLaptopCsv(text: string): ParsedLaptopOnlyRow[] {
         const kodeLaptop = (cols[idxLaptopCode] || '').trim();
         const merkLaptop = idxBrand !== -1 ? (cols[idxBrand] || '').trim() : 'Laptop Sekolah';
         const kodeSiswa = idxStudentRef !== -1 ? (cols[idxStudentRef] || '').trim() : '';
+        const wilayahRaw = idxWilayah !== -1 ? (cols[idxWilayah] || '').trim() : '';
+        const kelasRaw = idxClass !== -1 ? (cols[idxClass] || '').trim() : '';
         return {
           asset_code: kodeLaptop.toUpperCase(),
           brand_model: merkLaptop || 'Laptop Sekolah',
           student_code: kodeSiswa || undefined,
+          wilayah: parseWilayahCol(wilayahRaw, fallbackWilayah),
+          class: kelasRaw || undefined,
         };
       }
 
-      const [kodeLaptop, merkLaptop, kodeSiswa] = cols;
+      const [kodeLaptop, merkLaptop, kodeSiswa, wilayahCol, kelasCol] = cols;
       return {
         asset_code: (kodeLaptop || '').toUpperCase(),
         brand_model: merkLaptop || 'Laptop Sekolah',
         student_code: kodeSiswa ? kodeSiswa.trim() : undefined,
+        wilayah: parseWilayahCol(wilayahCol, fallbackWilayah),
+        class: kelasCol ? kelasCol.trim() : undefined,
       };
     })
     .filter((row) => Boolean(row.asset_code));

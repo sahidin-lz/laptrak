@@ -548,6 +548,23 @@ export default function App() {
     applyAndSyncState(res.state);
   };
 
+  const handleBulkSwitchStudentsWilayah = async (payload: {
+    targetWilayah: Wilayah;
+    studentIds?: string[];
+  }) => {
+    try {
+      const res = await api.bulkSwitchStudentsWilayah(payload);
+      setState(res.state);
+      await flushStateToFirestoreNow(res.state);
+      return { ok: true, updatedCount: res.updatedCount };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof ApiError ? err.message : 'Gagal memindahkan wilayah siswa.',
+      };
+    }
+  };
+
   const handleAddLaptop = async (payload: {
     asset_code: string;
     brand_model: string;
@@ -1072,6 +1089,7 @@ export default function App() {
               onAddStudent={handleAddStudent}
               onUpdateStudent={handleUpdateStudent}
               onBulkAddStudents={handleBulkAddStudents}
+              onBulkSwitchStudentsWilayah={handleBulkSwitchStudentsWilayah}
               onSuspendStudent={handleSuspendStudent}
               onResetSanction={handleResetSanction}
               onDeleteStudent={handleDeleteStudent}

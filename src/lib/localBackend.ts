@@ -105,8 +105,45 @@ function formatStudentCode(seqNum: number): string {
 function normalizeWilayah(raw: unknown, fallback: Wilayah = 'putra'): Wilayah {
   if (typeof raw !== 'string') return fallback;
   const v = raw.trim().toLowerCase();
-  if (v === 'putri' || v === 'pr' || v === 'perempuan' || v === 'p') return 'putri';
-  if (v === 'putra' || v === 'lk' || v === 'laki-laki' || v === 'l') return 'putra';
+  if (!v) return fallback;
+  if (
+    v === 'putri' ||
+    v === 'pr' ||
+    v === 'perempuan' ||
+    v === 'p' ||
+    v === 'pi' ||
+    v === 'w' ||
+    v === 'wanita' ||
+    v === 'akhwat' ||
+    v === 'banat' ||
+    v === 'female' ||
+    v === 'f' ||
+    v.includes('putri') ||
+    v.includes('perempuan') ||
+    v.includes('banat') ||
+    v.includes('akhwat')
+  ) {
+    return 'putri';
+  }
+  if (
+    v === 'putra' ||
+    v === 'lk' ||
+    v === 'laki-laki' ||
+    v === 'laki' ||
+    v === 'l' ||
+    v === 'pa' ||
+    v === 'pria' ||
+    v === 'ikhwan' ||
+    v === 'banin' ||
+    v === 'male' ||
+    v === 'm' ||
+    v.includes('putra') ||
+    v.includes('laki') ||
+    v.includes('banin') ||
+    v.includes('ikhwan')
+  ) {
+    return 'putra';
+  }
   return fallback;
 }
 
@@ -1611,11 +1648,36 @@ export const localBackend = {
     return { state: buildAppState() };
   },
 
+  bulkSwitchStudentsWilayah: async (payload: {
+    targetWilayah: Wilayah;
+    studentIds?: string[];
+  }) => {
+    const cleanTarget = normalizeWilayah(payload.targetWilayah, 'putri');
+    const idSet =
+      Array.isArray(payload.studentIds) && payload.studentIds.length > 0
+        ? new Set(payload.studentIds)
+        : null;
+    let updatedCount = 0;
+    for (const s of localDb.students) {
+      if (idSet && !idSet.has(s.id)) continue;
+      if (s.wilayah !== cleanTarget) {
+        s.wilayah = cleanTarget;
+        updatedCount++;
+      }
+    }
+    return {
+      updatedCount,
+      state: buildAppState(),
+    };
+  },
+
   bulkAddLaptops: async (
     rows: Array<{
       asset_code: string;
       brand_model: string;
       student_code?: string;
+      wilayah?: Wilayah;
+      class?: string;
     }>
   ) => {
     let createdLaptops = 0;
@@ -1625,12 +1687,22 @@ export const localBackend = {
     for (const raw of rows) {
       const code = (raw.asset_code || '').trim().toUpperCase();
       if (!code) continue;
+      const targetWilayah = normalizeWilayah(raw.wilayah, 'putra');
+      const targetClass = (raw.class || '10').trim();
       let matchedStudent: Student | null = null;
       if (raw.student_code?.trim()) {
         const ref = raw.student_code.trim();
         matchedStudent = findStudentByScannedCode(ref, localDb.students, localDb.laptops);
 
-        // If ref looks like a student name that isn't registered yet, auto-create the student!
+        // If student already exists and row specifies wilayah, update student's wilayah to match!
+        if (matchedStudent && raw.wilayah) {
+          matchedStudent.wilayah = targetWilayah;
+          if (raw.class?.trim()) {
+            matchedStudent.class = targetClass;
+          }
+        }
+
+        // If ref looks like a student name that isn't registered yet, auto-create the student with targetWilayah!
         if (!matchedStudent && !/^SIS[-_]?\d+$/i.test(ref) && ref.length >= 2) {
           const gen = generateNextUniqueStudentCode(localDb.students, localDb.studentSeq);
           localDb.studentSeq = gen.nextSeq;
@@ -1638,8 +1710,8 @@ export const localBackend = {
             id: makeId('stu'),
             student_code: gen.code,
             name: ref,
-            class: '10',
-            wilayah: 'putra',
+            class: targetClass,
+            wilayah: targetWilayah,
             photo_url: null,
             late_count: 0,
             is_suspended: false,
