@@ -181,12 +181,7 @@ function createInitialKioskState(): KioskPersistedState {
 function createInitialLocalDb(): LocalDatabase {
   const now = new Date();
   const todayDay = now.getDay();
-  const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-  const twoHoursFromNow = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-  const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
-  const fiveDaysFromNow = new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000);
   const twoDaysAgo = new Date(now.getTime() - 48 * 60 * 60 * 1000);
-  const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   const staff: LocalStaffRecord[] = [
     {
@@ -279,137 +274,9 @@ function createInitialLocalDb(): LocalDatabase {
     },
   ];
 
-  const students: Student[] = [
-    {
-      id: 'stu-1',
-      student_code: 'SIS-0001',
-      name: 'Ahmad Fauzi',
-      class: '10 IPA 1',
-      wilayah: 'putra',
-      photo_url: null,
-      late_count: 2,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-2',
-      student_code: 'SIS-0002',
-      name: 'Siti Aminah',
-      class: '11 IPS 2',
-      wilayah: 'putri',
-      photo_url: null,
-      late_count: 0,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-3',
-      student_code: 'SIS-0003',
-      name: 'Budi Santoso',
-      class: '12 IPA 1',
-      wilayah: 'putra',
-      photo_url: null,
-      late_count: 3,
-      is_suspended: true,
-      suspended_until: fiveDaysFromNow.toISOString(),
-      suspended_reason: 'Terlambat mengembalikan laptop sebanyak 3 kali (Sanksi Otomatis)',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-4',
-      student_code: 'SIS-0004',
-      name: 'Nadia Putri Rahma',
-      class: '10 IPA 2',
-      wilayah: 'putri',
-      photo_url: null,
-      late_count: 0,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-5',
-      student_code: 'SIS-0005',
-      name: 'Dimas Pratama',
-      class: '11 IPA 1',
-      wilayah: 'putra',
-      photo_url: null,
-      late_count: 1,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-6',
-      student_code: 'SIS-0006',
-      name: 'Rina Wulandari',
-      class: '12 IPS 1',
-      wilayah: 'putri',
-      photo_url: null,
-      late_count: 0,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-  ];
+  const students: Student[] = [];
 
-  const laptops: Laptop[] = [
-    {
-      id: 'lap-1',
-      asset_code: 'LAP-001',
-      brand_model: 'Lenovo ThinkPad T480',
-      status: 'available',
-      assigned_student_id: 'stu-1',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-2',
-      asset_code: 'LAP-002',
-      brand_model: 'Asus Vivobook 14',
-      status: 'borrowed',
-      assigned_student_id: 'stu-2',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-3',
-      asset_code: 'LAP-003',
-      brand_model: 'HP ProBook 440 G8',
-      status: 'available',
-      assigned_student_id: 'stu-3',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-4',
-      asset_code: 'LAP-004',
-      brand_model: 'Lenovo IdeaPad Slim 3',
-      status: 'available',
-      assigned_student_id: 'stu-4',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-5',
-      asset_code: 'LAP-005',
-      brand_model: 'Dell Latitude 5420',
-      status: 'borrowed',
-      assigned_student_id: 'stu-5',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-6',
-      asset_code: 'LAP-006',
-      brand_model: 'Acer TravelMate P2',
-      status: 'available',
-      assigned_student_id: 'stu-6',
-      created_at: twoDaysAgo.toISOString(),
-    },
-  ];
+  const laptops: Laptop[] = [];
 
   const schedules: Schedule[] = [
     {
@@ -444,72 +311,11 @@ function createInitialLocalDb(): LocalDatabase {
     },
   ];
 
-  const transactions: Transaction[] = [
-    {
-      id: 'tx-1',
-      student_id: 'stu-2',
-      laptop_id: 'lap-2',
-      wilayah: 'putri',
-      transaction_type: 'harian',
-      daily_session: 'sore',
-      home_note: null,
-      piket_id: 'stf-6',
-      piket_name: 'Ibu Ratna Sari (Piket Putri)',
-      return_piket_id: null,
-      return_piket_name: null,
-      purpose: 'Sesi Sore (Batas 17:30)',
-      borrow_time: oneHourAgo.toISOString(),
-      due_time: twoHoursFromNow.toISOString(),
-      return_time: null,
-      is_late: false,
-      late_minutes: 0,
-      status: 'active',
-    },
-    {
-      id: 'tx-6',
-      student_id: 'stu-5',
-      laptop_id: 'lap-5',
-      wilayah: 'putra',
-      transaction_type: 'pulang',
-      daily_session: null,
-      home_note: 'Izin pulang akhir pekan · Dijemput Ayah',
-      piket_id: 'stf-5',
-      piket_name: 'Ustadz Hendra Saputra (Piket Putra)',
-      return_piket_id: null,
-      return_piket_name: null,
-      purpose: 'Bawa Pulang ke Rumah',
-      borrow_time: oneHourAgo.toISOString(),
-      due_time: threeDaysFromNow.toISOString(),
-      return_time: null,
-      is_late: false,
-      late_minutes: 0,
-      status: 'active',
-    },
-    {
-      id: 'tx-2',
-      student_id: 'stu-1',
-      laptop_id: 'lap-1',
-      wilayah: 'putra',
-      transaction_type: 'harian',
-      daily_session: 'siang',
-      home_note: null,
-      piket_id: 'stf-5',
-      piket_name: 'Ustadz Hendra Saputra (Piket Putra)',
-      return_piket_id: 'stf-5',
-      return_piket_name: 'Ustadz Hendra Saputra (Piket Putra)',
-      purpose: 'Sesi Siang (Batas 14:30)',
-      borrow_time: new Date(oneDayAgo.getTime() - 3 * 60 * 60 * 1000).toISOString(),
-      due_time: new Date(oneDayAgo.getTime() - 1 * 60 * 60 * 1000).toISOString(),
-      return_time: new Date(oneDayAgo.getTime() - 35 * 60 * 1000).toISOString(),
-      is_late: true,
-      late_minutes: 25,
-      status: 'returned',
-    },
-  ];
+  const transactions: Transaction[] = [];
 
   return {
     adminClaimed: true,
-    studentSeq: 7,
+    studentSeq: 1,
     staff,
     students,
     laptops,
@@ -535,11 +341,10 @@ function loadLocalDb(): LocalDatabase {
         });
         parsed.students = sanitized.students;
         parsed.laptops = sanitized.laptops;
-        parsed.studentSeq = Math.max(parsed.studentSeq || 1, sanitized.nextStudentSeq);
+        parsed.transactions = sanitized.transactions;
+        parsed.studentSeq = Math.max(1, sanitized.nextStudentSeq);
 
-        // If this device already has uploaded data (> 6 default items) from before updatedAtMs was added,
-        // stamp it with a non-zero timestamp so it is automatically pushed to Firebase Firestore!
-        if (!parsed.updatedAtMs && (parsed.laptops.length > 6 || parsed.students.length > 6)) {
+        if (!parsed.updatedAtMs && (parsed.laptops.length > 0 || parsed.students.length > 0)) {
           parsed.updatedAtMs = Date.now();
           saveLocalDb(parsed);
         } else if (typeof parsed.updatedAtMs !== 'number') {
@@ -667,7 +472,8 @@ function buildAppState(touchModified = true): AppStatePayload {
   });
   localDb.students = sanitized.students;
   localDb.laptops = sanitized.laptops;
-  localDb.studentSeq = Math.max(localDb.studentSeq || 1, sanitized.nextStudentSeq);
+  localDb.transactions = sanitized.transactions;
+  localDb.studentSeq = Math.max(1, sanitized.nextStudentSeq);
 
   refreshExpiredSuspensions(localDb.students);
 
@@ -675,7 +481,7 @@ function buildAppState(touchModified = true): AppStatePayload {
     localDb.updatedAtMs = Date.now();
   } else if (typeof localDb.updatedAtMs !== 'number') {
     localDb.updatedAtMs =
-      localDb.laptops.length > 6 || localDb.students.length > 6 ? Date.now() : 0;
+      localDb.laptops.length > 0 || localDb.students.length > 0 ? Date.now() : 0;
   }
 
   const safeStaff: StaffMember[] = localDb.staff.map(
@@ -724,7 +530,8 @@ export function mirrorStateToLocalDb(state: Partial<AppStatePayload> | null | un
   });
   localDb.students = sanitized.students;
   localDb.laptops = sanitized.laptops;
-  localDb.studentSeq = Math.max(localDb.studentSeq, sanitized.nextStudentSeq);
+  localDb.transactions = sanitized.transactions;
+  localDb.studentSeq = Math.max(1, sanitized.nextStudentSeq);
   if (Array.isArray(state.schedules)) {
     localDb.schedules = [...state.schedules];
   }
@@ -1975,8 +1782,17 @@ export const localBackend = {
   },
 
   resetDemo: async () => {
-    localDb = createInitialLocalDb();
-    saveLocalDb(localDb);
+    const preservedStaff = localDb.staff;
+    const preservedClaimed = localDb.adminClaimed;
+    const preservedKiosk = localDb.kioskState;
+    const fresh = createInitialLocalDb();
+    localDb = {
+      ...fresh,
+      staff: preservedStaff,
+      adminClaimed: preservedClaimed,
+      kioskState: preservedKiosk,
+      updatedAtMs: Date.now(),
+    };
     return { state: buildAppState() };
   },
 };

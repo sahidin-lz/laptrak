@@ -368,12 +368,7 @@ function createInitialKioskState(): KioskPersistedState {
 function createInitialDb(): ServerDatabase {
   const now = new Date();
   const todayDay = now.getDay();
-  const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-  const twoHoursFromNow = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-  const threeDaysFromNow = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
-  const fiveDaysFromNow = new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000);
   const twoDaysAgo = new Date(now.getTime() - 48 * 60 * 60 * 1000);
-  const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
   const envAdminPass = process.env.ADMIN_DEFAULT_PASSCODE?.trim() || '121320';
   const envPiketPass = process.env.PIKET_DEFAULT_PASSCODE?.trim() || '121320';
@@ -472,137 +467,8 @@ function createInitialDb(): ServerDatabase {
     },
   ];
 
-  const students: Student[] = [
-    {
-      id: 'stu-1',
-      student_code: 'SIS-0001',
-      name: 'Ahmad Fauzi',
-      class: '10 IPA 1',
-      wilayah: 'putra',
-      photo_url: null,
-      late_count: 2,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-2',
-      student_code: 'SIS-0002',
-      name: 'Siti Aminah',
-      class: '11 IPS 2',
-      wilayah: 'putri',
-      photo_url: null,
-      late_count: 0,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-3',
-      student_code: 'SIS-0003',
-      name: 'Budi Santoso',
-      class: '12 IPA 1',
-      wilayah: 'putra',
-      photo_url: null,
-      late_count: 3,
-      is_suspended: true,
-      suspended_until: fiveDaysFromNow.toISOString(),
-      suspended_reason: 'Terlambat mengembalikan laptop sebanyak 3 kali (Sanksi Otomatis)',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-4',
-      student_code: 'SIS-0004',
-      name: 'Nadia Putri Rahma',
-      class: '10 IPA 2',
-      wilayah: 'putri',
-      photo_url: null,
-      late_count: 0,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-5',
-      student_code: 'SIS-0005',
-      name: 'Dimas Pratama',
-      class: '11 IPA 1',
-      wilayah: 'putra',
-      photo_url: null,
-      late_count: 1,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'stu-6',
-      student_code: 'SIS-0006',
-      name: 'Rina Wulandari',
-      class: '12 IPS 1',
-      wilayah: 'putri',
-      photo_url: null,
-      late_count: 0,
-      is_suspended: false,
-      suspended_until: null,
-      suspended_reason: null,
-      created_at: twoDaysAgo.toISOString(),
-    },
-  ];
-
-  const laptops: Laptop[] = [
-    {
-      id: 'lap-1',
-      asset_code: 'LAP-001',
-      brand_model: 'Lenovo ThinkPad T480',
-      status: 'available',
-      assigned_student_id: 'stu-1',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-2',
-      asset_code: 'LAP-002',
-      brand_model: 'Asus Vivobook 14',
-      status: 'borrowed',
-      assigned_student_id: 'stu-2',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-3',
-      asset_code: 'LAP-003',
-      brand_model: 'HP ProBook 440 G8',
-      status: 'available',
-      assigned_student_id: 'stu-3',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-4',
-      asset_code: 'LAP-004',
-      brand_model: 'Lenovo IdeaPad Slim 3',
-      status: 'available',
-      assigned_student_id: 'stu-4',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-5',
-      asset_code: 'LAP-005',
-      brand_model: 'Dell Latitude 5420',
-      status: 'borrowed',
-      assigned_student_id: 'stu-5',
-      created_at: twoDaysAgo.toISOString(),
-    },
-    {
-      id: 'lap-6',
-      asset_code: 'LAP-006',
-      brand_model: 'Acer TravelMate P2',
-      status: 'available',
-      assigned_student_id: 'stu-6',
-      created_at: twoDaysAgo.toISOString(),
-    },
-  ];
+  const students: Student[] = [];
+  const laptops: Laptop[] = [];
 
   const schedules: Schedule[] = [
     {
@@ -637,112 +503,11 @@ function createInitialDb(): ServerDatabase {
     },
   ];
 
-  const transactions: Transaction[] = [
-    {
-      id: 'tx-1',
-      student_id: 'stu-2',
-      laptop_id: 'lap-2',
-      wilayah: 'putri',
-      transaction_type: 'harian',
-      daily_session: 'sore',
-      home_note: null,
-      piket_id: 'stf-6',
-      piket_name: 'Ibu Ratna Sari (Piket Putri)',
-      return_piket_id: null,
-      return_piket_name: null,
-      purpose: 'Sesi Sore (Batas 17:30)',
-      borrow_time: oneHourAgo.toISOString(),
-      due_time: twoHoursFromNow.toISOString(),
-      return_time: null,
-      is_late: false,
-      late_minutes: 0,
-      status: 'active',
-    },
-    {
-      id: 'tx-6',
-      student_id: 'stu-5',
-      laptop_id: 'lap-5',
-      wilayah: 'putra',
-      transaction_type: 'pulang',
-      daily_session: null,
-      home_note: 'Izin pulang akhir pekan · Dijemput Ayah',
-      piket_id: 'stf-5',
-      piket_name: 'Ustadz Hendra Saputra (Piket Putra)',
-      return_piket_id: null,
-      return_piket_name: null,
-      purpose: 'Bawa Pulang ke Rumah',
-      borrow_time: oneHourAgo.toISOString(),
-      due_time: threeDaysFromNow.toISOString(),
-      return_time: null,
-      is_late: false,
-      late_minutes: 0,
-      status: 'active',
-    },
-    {
-      id: 'tx-2',
-      student_id: 'stu-1',
-      laptop_id: 'lap-1',
-      wilayah: 'putra',
-      transaction_type: 'harian',
-      daily_session: 'siang',
-      home_note: null,
-      piket_id: 'stf-5',
-      piket_name: 'Ustadz Hendra Saputra (Piket Putra)',
-      return_piket_id: 'stf-5',
-      return_piket_name: 'Ustadz Hendra Saputra (Piket Putra)',
-      purpose: 'Sesi Siang (Batas 14:30)',
-      borrow_time: new Date(oneDayAgo.getTime() - 3 * 60 * 60 * 1000).toISOString(),
-      due_time: new Date(oneDayAgo.getTime() - 1 * 60 * 60 * 1000).toISOString(),
-      return_time: new Date(oneDayAgo.getTime() - 35 * 60 * 1000).toISOString(),
-      is_late: true,
-      late_minutes: 25,
-      status: 'returned',
-    },
-    {
-      id: 'tx-3',
-      student_id: 'stu-3',
-      laptop_id: 'lap-3',
-      wilayah: 'putra',
-      transaction_type: 'harian',
-      daily_session: 'malam',
-      home_note: null,
-      piket_id: 'stf-7',
-      piket_name: 'Ustadz Ridwan Kamil (Piket Malam Putra)',
-      return_piket_id: 'stf-7',
-      return_piket_name: 'Ustadz Ridwan Kamil (Piket Malam Putra)',
-      purpose: 'Sesi Malam (Batas 21:30)',
-      borrow_time: new Date(oneDayAgo.getTime() - 5 * 60 * 60 * 1000).toISOString(),
-      due_time: new Date(oneDayAgo.getTime() - 3 * 60 * 60 * 1000).toISOString(),
-      return_time: new Date(oneDayAgo.getTime() - 2 * 60 * 60 * 1000 - 18 * 60 * 1000).toISOString(),
-      is_late: true,
-      late_minutes: 42,
-      status: 'returned',
-    },
-    {
-      id: 'tx-4',
-      student_id: 'stu-4',
-      laptop_id: 'lap-4',
-      wilayah: 'putri',
-      transaction_type: 'pulang',
-      daily_session: null,
-      home_note: 'Libur tengah semester · Dijemput Ibu',
-      piket_id: 'stf-6',
-      piket_name: 'Ibu Ratna Sari (Piket Putri)',
-      return_piket_id: 'stf-6',
-      return_piket_name: 'Ibu Ratna Sari (Piket Putri)',
-      purpose: 'Bawa Pulang ke Rumah',
-      borrow_time: new Date(twoDaysAgo.getTime() - 24 * 60 * 60 * 1000).toISOString(),
-      due_time: new Date(oneDayAgo.getTime() + 4 * 60 * 60 * 1000).toISOString(),
-      return_time: new Date(oneDayAgo.getTime() + 1 * 60 * 60 * 1000).toISOString(),
-      is_late: false,
-      late_minutes: 0,
-      status: 'returned',
-    },
-  ];
+  const transactions: Transaction[] = [];
 
   return {
     adminClaimed: Boolean(envAdminPass),
-    studentSeq: 7,
+    studentSeq: 1,
     updatedAtMs: 0,
     staff,
     students,
@@ -768,11 +533,12 @@ function loadServerDbFromDisk(): ServerDatabase {
         });
         parsed.students = sanitized.students;
         parsed.laptops = sanitized.laptops;
-        parsed.studentSeq = Math.max(parsed.studentSeq || 1, sanitized.nextStudentSeq);
+        parsed.transactions = sanitized.transactions;
+        parsed.studentSeq = Math.max(1, sanitized.nextStudentSeq);
 
         if (typeof parsed.updatedAtMs !== 'number') {
           parsed.updatedAtMs =
-            parsed.laptops.length > 6 || parsed.students.length > 6 ? Date.now() : 0;
+            parsed.laptops.length > 0 || parsed.students.length > 0 ? Date.now() : 0;
         }
         return parsed;
       }
@@ -878,7 +644,8 @@ function ensureServerStudentsHaveLaptopAllocation() {
   });
   db.students = preSanitized.students;
   db.laptops = preSanitized.laptops;
-  db.studentSeq = Math.max(db.studentSeq || 1, preSanitized.nextStudentSeq);
+  db.transactions = preSanitized.transactions;
+  db.studentSeq = Math.max(1, preSanitized.nextStudentSeq);
 
   const assignedStudentIds = new Set(
     db.laptops.map((l) => l.assigned_student_id).filter(Boolean) as string[]
@@ -930,13 +697,14 @@ function buildStateForRole(_role: StaffRole | 'public', touchModified = true) {
   });
   db.students = sanitized.students;
   db.laptops = sanitized.laptops;
-  db.studentSeq = Math.max(db.studentSeq || 1, sanitized.nextStudentSeq);
+  db.transactions = sanitized.transactions;
+  db.studentSeq = Math.max(1, sanitized.nextStudentSeq);
 
   refreshExpiredSuspensions(db.students);
   if (touchModified) {
     db.updatedAtMs = Date.now();
   } else if (typeof db.updatedAtMs !== 'number') {
-    db.updatedAtMs = db.laptops.length > 6 || db.students.length > 6 ? Date.now() : 0;
+    db.updatedAtMs = db.laptops.length > 0 || db.students.length > 0 ? Date.now() : 0;
   }
   saveServerDbToDisk(db);
   return {

@@ -1011,8 +1011,79 @@ export function getAssignedLaptopForStudent(
   return laptops.find((l) => l.assigned_student_id === studentId);
 }
 
+const LEGACY_DUMMY_STUDENT_IDS = new Set([
+  'stu-1',
+  'stu-2',
+  'stu-3',
+  'stu-4',
+  'stu-5',
+  'stu-6',
+]);
+
+const LEGACY_DUMMY_STUDENT_NAMES = new Set([
+  'ahmad fauzi',
+  'siti aminah',
+  'budi santoso',
+  'nadia putri rahma',
+  'dimas pratama',
+  'rina wulandari',
+]);
+
+const LEGACY_DUMMY_LAPTOP_IDS = new Set([
+  'lap-1',
+  'lap-2',
+  'lap-3',
+  'lap-4',
+  'lap-5',
+  'lap-6',
+]);
+
+const LEGACY_DUMMY_TX_IDS = new Set([
+  'tx-1',
+  'tx-2',
+  'tx-3',
+  'tx-4',
+  'tx-5',
+  'tx-6',
+]);
+
+export function isLegacyDummyStudent(s: Student | null | undefined): boolean {
+  if (!s) return false;
+  if (LEGACY_DUMMY_STUDENT_IDS.has(s.id)) return true;
+  if (
+    /^stu-[1-6]$/.test(s.id) ||
+    (LEGACY_DUMMY_STUDENT_NAMES.has((s.name || '').trim().toLowerCase()) &&
+      /^SIS-000[1-6]$/i.test((s.student_code || '').trim()))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isLegacyDummyLaptop(l: Laptop | null | undefined): boolean {
+  if (!l) return false;
+  if (LEGACY_DUMMY_LAPTOP_IDS.has(l.id)) return true;
+  if (l.assigned_student_id && LEGACY_DUMMY_STUDENT_IDS.has(l.assigned_student_id)) {
+    return true;
+  }
+  return false;
+}
+
+export function isLegacyDummyTransaction(t: Transaction | null | undefined): boolean {
+  if (!t) return false;
+  if (LEGACY_DUMMY_TX_IDS.has(t.id)) return true;
+  if (
+    LEGACY_DUMMY_STUDENT_IDS.has(t.student_id) ||
+    LEGACY_DUMMY_LAPTOP_IDS.has(t.laptop_id)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Sanitizes and self-heals the database records so that:
+ * 0. Legacy dummy seed students (`stu-1`..`stu-6`), dummy laptops (`lap-1`..`lap-6`), and dummy transactions (`tx-1`..`tx-6`) are purged.
  * 1. Every student has a trimmed, uppercase, 100% unique `student_code`.
  * 2. Every laptop has a trimmed, uppercase, 100% unique `asset_code`.
  * 3. Strict 1-to-1 Student <-> Laptop ownership: at most ONE laptop can have `assigned_student_id === student.id`.
@@ -1027,21 +1098,27 @@ export function sanitizeDatabaseRecords(data: {
 }): {
   students: Student[];
   laptops: Laptop[];
+  transactions: Transaction[];
   nextStudentSeq: number;
 } {
+  const cleanTransactions = (data.transactions || []).filter(
+    (t) => !isLegacyDummyTransaction(t)
+  );
+
   const activeLaptopIds = new Set(
-    (data.transactions || [])
+    cleanTransactions
       .filter((t) => t.status === 'active')
       .map((t) => t.laptop_id)
   );
 
-  // 1. Normalize & ensure unique student_code for every student
+  // 1. Normalize & ensure unique student_code for every non-dummy student
   const seenStudentIds = new Set<string>();
   const usedStudentCompactCodes = new Set<string>();
   const cleanStudents: Student[] = [];
 
   for (const rawStu of data.students) {
     if (!rawStu || !rawStu.id || seenStudentIds.has(rawStu.id)) continue;
+    if (isLegacyDummyStudent(rawStu)) continue;
     seenStudentIds.add(rawStu.id);
 
     let code = (rawStu.student_code || '').trim().toUpperCase();
@@ -1062,11 +1139,12 @@ export function sanitizeDatabaseRecords(data: {
 
   const validStudentMap = new Map(cleanStudents.map((s) => [s.id, s]));
 
-  // 2. Deduplicate laptops by ID & normalize asset_code
+  // 2. Deduplicate laptops by ID (excluding legacy dummy laptops) & normalize asset_code
   const seenLaptopIds = new Set<string>();
   const rawLaptops: Laptop[] = [];
   for (const rawLap of data.laptops) {
     if (!rawLap || !rawLap.id || seenLaptopIds.has(rawLap.id)) continue;
+    if (isLegacyDummyLaptop(rawLap)) continue;
     seenLaptopIds.add(rawLap.id);
     const cleanAssigned =
       rawLap.assigned_student_id && validStudentMap.has(rawLap.assigned_student_id)
@@ -1165,6 +1243,7 @@ export function sanitizeDatabaseRecords(data: {
   return {
     students: cleanStudents,
     laptops: cleanLaptops,
+    transactions: cleanTransactions,
     nextStudentSeq: nextSeqInfo.nextSeq - 1,
   };
 }

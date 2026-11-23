@@ -169,7 +169,6 @@ export default function App() {
       if (
         cachedOrFirestoreBundle &&
         Array.isArray(cachedOrFirestoreBundle.students) &&
-        cachedOrFirestoreBundle.students.length > 0 &&
         (cloudTime >= bestTime || bestTime === 0)
       ) {
         bestBundle = cachedOrFirestoreBundle;
@@ -775,7 +774,8 @@ export default function App() {
 
   const handleResetDemo = async () => {
     const res = await api.resetDemo();
-    applyAndSyncState(res.state, 1500);
+    setState(res.state);
+    await flushStateToFirestoreNow(res.state);
   };
 
   return (
