@@ -983,8 +983,8 @@ async function startServer() {
       if (Array.isArray(bundle.schedules)) {
         db.schedules = bundle.schedules.slice(0, 200);
       }
-      if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
-        db.dailySessions = bundle.dailySessions;
+      if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length >= 1) {
+        db.dailySessions = bundle.dailySessions.slice(0, 20);
       }
       if (bundle.printSettings && typeof bundle.printSettings === 'object') {
         db.printSettings = {
@@ -1035,7 +1035,6 @@ async function startServer() {
       'scan_student',
       'validation_panel',
     ];
-    const validSessions: DailySessionKey[] = ['siang', 'sore', 'malam', 'kegiatan_lainnya'];
 
     if (typeof patch.activePage === 'string' && validPages.includes(patch.activePage as ActivePage)) {
       db.kioskState.activePage = patch.activePage as ActivePage;
@@ -1082,9 +1081,9 @@ async function startServer() {
     }
     if (
       typeof patch.selectedSessionKey === 'string' &&
-      validSessions.includes(patch.selectedSessionKey as DailySessionKey)
+      patch.selectedSessionKey.trim().length > 0
     ) {
-      db.kioskState.selectedSessionKey = patch.selectedSessionKey as DailySessionKey;
+      db.kioskState.selectedSessionKey = patch.selectedSessionKey.trim() as DailySessionKey;
     }
     if (typeof patch.customActivityInput === 'string') {
       db.kioskState.customActivityInput = patch.customActivityInput.slice(0, 140);
@@ -1216,11 +1215,8 @@ async function startServer() {
     const transactionType: TransactionType =
       req.body?.transactionType === 'pulang' ? 'pulang' : 'harian';
     const dailySessionKey: DailySessionKey =
-      req.body?.dailySession === 'siang' ||
-      req.body?.dailySession === 'sore' ||
-      req.body?.dailySession === 'malam' ||
-      req.body?.dailySession === 'kegiatan_lainnya'
-        ? req.body.dailySession
+      typeof req.body?.dailySession === 'string' && req.body.dailySession.trim()
+        ? (req.body.dailySession.trim() as DailySessionKey)
         : 'sore';
     const customActivity =
       typeof req.body?.customActivity === 'string' && req.body.customActivity.trim()
@@ -2040,27 +2036,39 @@ async function startServer() {
     (req: AuthedRequest, res) => {
       const sessionsInput = Array.isArray(req.body?.sessions) ? req.body.sessions : [];
       if (sessionsInput.length > 0) {
-        db.dailySessions = db.dailySessions.map((existing) => {
-          const found = sessionsInput.find((item: { key?: string }) => item?.key === existing.key);
-          if (!found) return existing;
+        const seenKeys = new Set<string>();
+        const normalized: DailySessionConfig[] = [];
+        for (const item of sessionsInput.slice(0, 20)) {
+          if (!item || typeof item !== 'object') continue;
+          const rawLabel =
+            typeof item.label === 'string' ? item.label.trim().slice(0, 60) : '';
+          const rawKey =
+            typeof item.key === 'string' && item.key.trim()
+              ? item.key.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_').slice(0, 40)
+              : rawLabel.toLowerCase().replace(/[^a-z0-9_-]/g, '_').slice(0, 40) ||
+                `sesi_${normalized.length + 1}`;
+          if (!rawKey || seenKeys.has(rawKey)) continue;
+          seenKeys.add(rawKey);
           const startTime =
-            typeof found.start_time === 'string' && /^\d{2}:\d{2}$/.test(found.start_time.trim())
-              ? found.start_time.trim()
-              : existing.start_time;
+            typeof item.start_time === 'string' && /^\d{2}:\d{2}$/.test(item.start_time.trim())
+              ? item.start_time.trim()
+              : '07:30';
           const deadlineTime =
-            typeof found.deadline_time === 'string' &&
-            /^\d{2}:\d{2}$/.test(found.deadline_time.trim())
-              ? found.deadline_time.trim()
-              : existing.deadline_time;
-          const isActive =
-            typeof found.is_active === 'boolean' ? found.is_active : existing.is_active;
-          return {
-            ...existing,
+            typeof item.deadline_time === 'string' &&
+            /^\d{2}:\d{2}$/.test(item.deadline_time.trim())
+              ? item.deadline_time.trim()
+              : '14:30';
+          normalized.push({
+            key: rawKey,
+            label: rawLabel || `Sesi ${normalized.length + 1}`,
             start_time: startTime,
             deadline_time: deadlineTime,
-            is_active: isActive,
-          };
-        });
+            is_active: typeof item.is_active === 'boolean' ? item.is_active : true,
+          });
+        }
+        if (normalized.length > 0) {
+          db.dailySessions = normalized;
+        }
       }
       res.json({ state: buildStateForRole('admin') });
     }

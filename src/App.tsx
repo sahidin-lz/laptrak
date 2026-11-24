@@ -82,9 +82,10 @@ const ADMIN_NAV_ITEMS: NavConfig[] = [
   },
   {
     id: 'suspend',
-    label: 'Siswa di Suspend',
-    shortLabel: 'Suspend',
-    breadcrumb: 'Menu Khusus Admin: Daftar Siswa di-Suspend, Tambah, Edit & Cabut Sanksi',
+    label: 'Kontrol Sesi, Kepulangan & Suspend',
+    shortLabel: 'Kontrol Sesi',
+    breadcrumb:
+      'Menu Kontrol Sesi (Ubah & Tambah Jenis/Jam Sesi), Pengambilan Laptop Kepulangan & Daftar Suspend Siswa',
     icon: ShieldAlert,
   },
   {
@@ -1066,6 +1067,9 @@ export default function App() {
 
           {(activePage === 'database' || activePage === 'suspend') && isAdmin && (
             <MonitoringView
+              currentUser={user}
+              staff={state.staff}
+              piketOptions={state.piketOptions}
               students={state.students}
               laptops={state.laptops}
               dailySessions={state.dailySessions}
@@ -1075,6 +1079,41 @@ export default function App() {
                 activePage === 'suspend' ? 'suspend_siswa' : 'pemakaian_lengkap'
               }
               onManualReturn={handleManualReturn}
+              onBorrow={handleBorrow}
+              onUpdateDailySessions={handleUpdateDailySessions}
+              onOpenKepulanganKiosk={(targetWilayah) => {
+                const adminStaff = state.staff.find(
+                  (s) => (user && s.id === user.id) || s.role === 'admin'
+                );
+                const fallbackTicket =
+                  state.kioskState.piketTicket ||
+                  (adminStaff
+                    ? {
+                        id: adminStaff.id,
+                        name: adminStaff.name,
+                        role: adminStaff.role,
+                        wilayah: adminStaff.wilayah,
+                        piket_token: adminStaff.piket_token,
+                        ticket_number: `TKT-${adminStaff.piket_token}-${new Date()
+                          .toTimeString()
+                          .slice(0, 5)
+                          .replace(':', '')}`,
+                        issued_at: new Date().toISOString(),
+                      }
+                    : null);
+
+                setActivePage('scan');
+                handleUpdateKioskState(
+                  {
+                    activePage: 'scan',
+                    scanMode: 'pulang',
+                    selectedWilayah: targetWilayah || state.kioskState.selectedWilayah,
+                    piketTicket: fallbackTicket,
+                    wizardStep: fallbackTicket ? 'scan_student' : 'piket_login',
+                  },
+                  true
+                );
+              }}
               onSuspendStudent={handleSuspendStudent}
               onResetSanction={handleResetSanction}
               onDeleteTransaction={handleDeleteTransaction}

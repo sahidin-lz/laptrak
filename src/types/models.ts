@@ -24,10 +24,10 @@ export const DAYS_ID = [
 export type Wilayah = 'putra' | 'putri';
 export type StaffWilayah = Wilayah | 'semua';
 export type TransactionType = 'harian' | 'pulang';
-export type DailySessionKey = 'siang' | 'sore' | 'malam' | 'kegiatan_lainnya';
+export type DailySessionKey = 'siang' | 'sore' | 'malam' | 'kegiatan_lainnya' | (string & {});
 
 export interface DailySessionConfig {
-  key: 'siang' | 'sore' | 'malam';
+  key: string;
   label: string;
   start_time: string;    // "HH:MM"
   deadline_time: string; // "HH:MM" — Batas jam yang membuat siswa teridentifikasi telat

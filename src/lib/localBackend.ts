@@ -516,7 +516,7 @@ export function mirrorStateToLocalDb(state: Partial<AppStatePayload> | null | un
   if (Array.isArray(state.schedules)) {
     localDb.schedules = [...state.schedules];
   }
-  if (Array.isArray(state.dailySessions) && state.dailySessions.length === 3) {
+  if (Array.isArray(state.dailySessions) && state.dailySessions.length >= 1) {
     localDb.dailySessions = [...state.dailySessions];
   }
   if (state.printSettings) {
@@ -766,7 +766,7 @@ export const localBackend = {
       if (Array.isArray(bundle.schedules)) {
         localDb.schedules = [...bundle.schedules];
       }
-      if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length === 3) {
+      if (Array.isArray(bundle.dailySessions) && bundle.dailySessions.length >= 1) {
         localDb.dailySessions = [...bundle.dailySessions];
       }
       if (bundle.printSettings) {
@@ -821,7 +821,13 @@ export const localBackend = {
       'scan_student',
       'validation_panel',
     ];
-    const validSessions: DailySessionKey[] = ['siang', 'sore', 'malam', 'kegiatan_lainnya'];
+    const validSessions = new Set<string>([
+      'siang',
+      'sore',
+      'malam',
+      'kegiatan_lainnya',
+      ...localDb.dailySessions.map((s) => s.key),
+    ]);
 
     if (patch.activePage && validPages.includes(patch.activePage)) {
       localDb.kioskState.activePage = patch.activePage;
@@ -838,7 +844,11 @@ export const localBackend = {
     if (patch.scanMode === 'harian' || patch.scanMode === 'pulang') {
       localDb.kioskState.scanMode = patch.scanMode;
     }
-    if (patch.selectedSessionKey && validSessions.includes(patch.selectedSessionKey)) {
+    if (
+      patch.selectedSessionKey &&
+      typeof patch.selectedSessionKey === 'string' &&
+      (validSessions.has(patch.selectedSessionKey) || patch.selectedSessionKey.trim().length > 0)
+    ) {
       localDb.kioskState.selectedSessionKey = patch.selectedSessionKey;
     }
     if (typeof patch.customActivityInput === 'string') {
@@ -1015,15 +1025,22 @@ export const localBackend = {
 
     const dailySessionKey: DailySessionKey = payload.dailySession || 'sore';
     const isKegiatanLainnya = dailySessionKey === 'kegiatan_lainnya';
-    const sessionConfig = isKegiatanLainnya
+    const sessionConfig: DailySessionConfig = isKegiatanLainnya
       ? {
-          key: 'sore' as const,
+          key: 'kegiatan_lainnya',
           label: 'Kegiatan Lainnya',
           start_time: '07:00',
           deadline_time: payload.customDeadlineTime || '17:30',
           is_active: true,
         }
-      : localDb.dailySessions.find((s) => s.key === dailySessionKey) || localDb.dailySessions[1];
+      : localDb.dailySessions.find((s) => s.key === dailySessionKey) ||
+        localDb.dailySessions[0] || {
+          key: 'sore',
+          label: 'Sesi Sore',
+          start_time: '15:30',
+          deadline_time: '17:30',
+          is_active: true,
+        };
 
     if (payload.transactionType === 'harian') {
       const bimbelValidation = validateStudentBimbelSchedule(student, new Date());
@@ -1627,10 +1644,38 @@ export const localBackend = {
   },
 
   updateDailySessions: async (sessions: DailySessionConfig[]) => {
-    localDb.dailySessions = localDb.dailySessions.map((existing) => {
-      const found = sessions.find((s) => s.key === existing.key);
-      return found ? { ...existing, ...found } : existing;
-    });
+    if (Array.isArray(sessions) && sessions.length > 0) {
+      const seenKeys = new Set<string>();
+      const normalized: DailySessionConfig[] = [];
+      for (const item of sessions) {
+        if (!item || typeof item !== 'object') continue;
+        const rawLabel = typeof item.label === 'string' ? item.label.trim() : '';
+        const rawKey =
+          typeof item.key === 'string' && item.key.trim()
+            ? item.key.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_')
+            : rawLabel.toLowerCase().replace(/[^a-z0-9_-]/g, '_') || `sesi_${normalized.length + 1}`;
+        if (!rawKey || seenKeys.has(rawKey)) continue;
+        seenKeys.add(rawKey);
+        const startTime =
+          typeof item.start_time === 'string' && /^\d{2}:\d{2}$/.test(item.start_time.trim())
+            ? item.start_time.trim()
+            : '07:30';
+        const deadlineTime =
+          typeof item.deadline_time === 'string' && /^\d{2}:\d{2}$/.test(item.deadline_time.trim())
+            ? item.deadline_time.trim()
+            : '14:30';
+        normalized.push({
+          key: rawKey,
+          label: rawLabel || `Sesi ${normalized.length + 1}`,
+          start_time: startTime,
+          deadline_time: deadlineTime,
+          is_active: typeof item.is_active === 'boolean' ? item.is_active : true,
+        });
+      }
+      if (normalized.length > 0) {
+        localDb.dailySessions = normalized;
+      }
+    }
     return { state: buildAppState() };
   },
 

@@ -30,13 +30,13 @@ export function getAuthToken(): string | null {
 export class ApiError extends Error {
   status: number;
   code?: string;
-  correctedSession?: 'siang' | 'sore' | 'malam' | null;
+  correctedSession?: string | null;
   correctedLabel?: string | null;
   constructor(
     message: string,
     status: number,
     code?: string,
-    correctedSession?: 'siang' | 'sore' | 'malam' | null,
+    correctedSession?: string | null,
     correctedLabel?: string | null
   ) {
     super(message);

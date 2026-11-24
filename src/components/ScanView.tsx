@@ -87,7 +87,7 @@ interface ScanViewProps {
     transaction?: Transaction;
     code?: string;
     error?: string;
-    correctedSession?: 'siang' | 'sore' | 'malam' | null;
+    correctedSession?: string | null;
     correctedLabel?: string | null;
   }>;
   onReturn: (
@@ -196,10 +196,10 @@ export function ScanView({
 
   // Automatic Session Time Guard & Correction Alert state
   const [sessionTimeCorrectionAlert, setSessionTimeCorrectionAlert] = useState<{
-    attemptedKey: 'siang' | 'sore' | 'malam';
+    attemptedKey: string;
     attemptedLabel: string;
     reason: string;
-    correctedSession: 'siang' | 'sore' | 'malam';
+    correctedSession: string;
     correctedLabel: string;
   } | null>(null);
   const [liveSessionAutoAdjustedBanner, setLiveSessionAutoAdjustedBanner] = useState<string | null>(
@@ -426,7 +426,7 @@ export function ScanView({
     );
   };
 
-  const handleChooseQuickDailySession = (key: 'siang' | 'sore' | 'malam') => {
+  const handleChooseQuickDailySession = (key: string) => {
     const check = validateDailySessionSelection(key, dailySessions, new Date());
     const chosenCfg = dailySessions.find((s) => s.key === key);
 
@@ -1321,12 +1321,16 @@ export function ScanView({
                         </p>
                         <span
                           className={`inline-block rounded-md px-2 py-0.5 text-[10px] font-extrabold ${
-                            checkNow.allowed
+                            sess.is_active === false
+                              ? 'bg-rose-200 text-rose-900'
+                              : checkNow.allowed
                               ? 'bg-emerald-700 text-white'
                               : 'bg-slate-200 text-slate-700'
                           }`}
                         >
-                          {checkNow.allowed
+                          {sess.is_active === false
+                            ? 'SESI DINONAKTIFKAN ADMIN'
+                            : checkNow.allowed
                             ? isAutoSelected
                               ? '✓ OTOMATIS DIPILIH SISTEM'
                               : 'SESUAI JAM SEKARANG'
@@ -1490,14 +1494,44 @@ export function ScanView({
                 </h2>
               </div>
 
-              <button
-                type="button"
-                onClick={() => updateStepAndPersist('select_session', {}, false)}
-                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-3.5 py-2 text-xs font-bold text-white hover:bg-white/20"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" />
-                Ubah Sesi
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (scanMode === 'pulang') {
+                      const nextKey = autoSuggestedSessionKey;
+                      setScanMode('harian');
+                      setSelectedSessionKey(nextKey);
+                      onUpdateKioskState({ scanMode: 'harian', selectedSessionKey: nextKey }, true);
+                      playFeedback('scan');
+                    } else {
+                      const defaultDate = plannedReturnDate || getDefaultReturnDateInput(3);
+                      setPlannedReturnDate(defaultDate);
+                      setScanMode('pulang');
+                      onUpdateKioskState({ scanMode: 'pulang', plannedReturnDate: defaultDate }, true);
+                      playFeedback('scan');
+                    }
+                  }}
+                  className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-extrabold transition-colors ${
+                    scanMode === 'pulang'
+                      ? 'border-amber-300 bg-amber-400 text-slate-950 hover:bg-amber-300'
+                      : 'border-violet-300/40 bg-violet-600/80 text-white hover:bg-violet-500'
+                  }`}
+                >
+                  <Home className="h-3.5 w-3.5" />
+                  {scanMode === 'pulang'
+                    ? 'Pindah ke Scan Sesi Harian'
+                    : 'Mode Pengambilan Laptop Kepulangan'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => updateStepAndPersist('select_session', {}, false)}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-3.5 py-2 text-xs font-bold text-white hover:bg-white/20"
+                >
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  Ubah Sesi
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1730,6 +1764,53 @@ export function ScanView({
                         placeholder="Ketik nama kegiatan siswa..."
                         className="mt-1.5 min-h-[42px] w-full rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-bold text-slate-900 outline-none focus:border-blue-600"
                       />
+                    </div>
+                  )}
+
+                  {/* Form Detail Pengambilan Laptop Kepulangan (Bawa Pulang) */}
+                  {assignedLaptop?.status === 'available' && scanMode === 'pulang' && (
+                    <div className="space-y-2.5 rounded-xl border-2 border-violet-300 bg-violet-50/70 p-3.5">
+                      <div className="flex items-center gap-1.5 text-xs font-extrabold text-violet-950">
+                        <Home className="h-4 w-4 text-violet-700" />
+                        Detail Pengambilan Laptop Kepulangan (Bawa Pulang)
+                      </div>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <div>
+                          <label className="mb-1 block text-[11px] font-bold text-violet-900">
+                            Estimasi Tanggal Kembali ke Sekolah
+                          </label>
+                          <input
+                            type="date"
+                            value={plannedReturnDate}
+                            min={getDefaultReturnDateInput(0)}
+                            onChange={(e) => {
+                              setPlannedReturnDate(e.target.value);
+                              onUpdateKioskState({ plannedReturnDate: e.target.value }, false);
+                            }}
+                            className="min-h-[40px] w-full rounded-lg border border-violet-300 bg-white px-2.5 py-1.5 font-mono text-xs font-bold text-slate-900 outline-none focus:border-violet-700"
+                          />
+                        </div>
+                        <div>
+                          <label className="mb-1 block text-[11px] font-bold text-violet-900">
+                            Keterangan Izin Kepulangan / Penjemput
+                          </label>
+                          <input
+                            type="text"
+                            value={homeNote}
+                            onChange={(e) => {
+                              setHomeNote(e.target.value);
+                            }}
+                            onBlur={() => {
+                              onUpdateKioskState({ homeNote }, false);
+                            }}
+                            placeholder="Contoh: Izin pulang akhir pekan · Dijemput orang tua"
+                            className="min-h-[40px] w-full rounded-lg border border-violet-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900 outline-none focus:border-violet-700"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-[11px] font-semibold text-violet-800">
+                        Sekarang scan barcode Gantungan Tas <strong>{assignedLaptop.asset_code}</strong> untuk mencatat pengambilan laptop kepulangan.
+                      </p>
                     </div>
                   )}
                 </div>

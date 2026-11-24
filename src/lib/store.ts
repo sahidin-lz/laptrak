@@ -59,28 +59,34 @@ export function timeStringToMinutes(hhmm: string): number {
 export function getCurrentSuggestedSessionKey(
   dailySessions?: DailySessionConfig[],
   now = new Date()
-): 'siang' | 'sore' | 'malam' {
+): string {
   const nowMins = now.getHours() * 60 + now.getMinutes();
 
   if (dailySessions && dailySessions.length > 0) {
+    const activeSessions = dailySessions.filter((s) => s.is_active);
+    const pool = activeSessions.length > 0 ? activeSessions : dailySessions;
+
     // 1. Exact match inside [start_time, deadline_time]
-    for (const s of dailySessions) {
-      if (!s.is_active) continue;
+    for (const s of pool) {
       const startM = timeStringToMinutes(s.start_time);
       const endM = timeStringToMinutes(s.deadline_time);
       if (nowMins >= startM && nowMins <= endM) {
         return s.key;
       }
     }
-    // 2. Fallback based on configured session boundaries
-    const soreSession = dailySessions.find((s) => s.key === 'sore');
-    const malamSession = dailySessions.find((s) => s.key === 'malam');
-    const soreStart = soreSession ? timeStringToMinutes(soreSession.start_time) : 15 * 60;
-    const malamStart = malamSession ? timeStringToMinutes(malamSession.start_time) : 18 * 60 + 30;
 
-    if (nowMins < soreStart) return 'siang';
-    if (nowMins < malamStart) return 'sore';
-    return 'malam';
+    // 2. Nearest upcoming or most recent session based on configured start_time sorted chronologically
+    const sorted = [...pool].sort(
+      (a, b) => timeStringToMinutes(a.start_time) - timeStringToMinutes(b.start_time)
+    );
+    let bestKey = sorted[0].key;
+    for (const s of sorted) {
+      const startM = timeStringToMinutes(s.start_time);
+      if (nowMins >= startM) {
+        bestKey = s.key;
+      }
+    }
+    return bestKey;
   }
 
   const h = now.getHours();
@@ -98,9 +104,9 @@ export function getTimeOfDayLabel(now = new Date()): string {
 }
 
 /**
- * Validates whether a Guru Piket's chosen daily session ('siang' | 'sore' | 'malam')
- * matches the current clock time. If the teacher selects e.g. "Sesi Sore" while the clock
- * shows morning/afternoon, it blocks and returns the corrected session.
+ * Validates whether a Guru Piket's chosen daily session (standard or custom added session)
+ * matches the current clock time. If the teacher selects a session outside its active window
+ * while another session is active, it blocks and returns the corrected session.
  */
 export function validateDailySessionSelection(
   chosenKey: DailySessionKey,
@@ -111,7 +117,7 @@ export function validateDailySessionSelection(
   currentTimeStr: string;
   timeOfDayLabel: string;
   chosenSession: DailySessionConfig | null;
-  correctedSession: 'siang' | 'sore' | 'malam';
+  correctedSession: string;
   correctedLabel: string;
   reason: string;
   message?: string;
@@ -123,8 +129,9 @@ export function validateDailySessionSelection(
   const suggestedKey = getCurrentSuggestedSessionKey(dailySessions, now);
   const correctedSessionObj =
     dailySessions.find((s) => s.key === suggestedKey) ||
+    dailySessions.find((s) => s.is_active) ||
     dailySessions[0] || {
-      key: 'siang' as const,
+      key: 'siang',
       label: 'Sesi Siang',
       start_time: '07:30',
       deadline_time: '14:30',
@@ -177,7 +184,7 @@ export function validateDailySessionSelection(
   const endMins = timeStringToMinutes(chosenSession.deadline_time);
   const isInsideWindow = nowMins >= startMins && nowMins <= endMins;
 
-  // Allow if inside configured [start_time, deadline_time] OR if chosenKey matches the current time-of-day bucket
+  // Allow if inside configured [start_time, deadline_time] OR if chosenKey matches the current suggested session
   if (isInsideWindow || chosenKey === suggestedKey) {
     return {
       allowed: true,

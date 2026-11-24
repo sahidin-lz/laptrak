@@ -219,8 +219,11 @@ export function MasterView({
   const [formMsg, setFormMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  // Editable 3 Daily Sessions (Siang, Sore, Malam)
+  // Editable Daily Sessions (Siang, Sore, Malam + Custom Added Session Types)
   const [editableSessions, setEditableSessions] = useState<DailySessionConfig[]>(dailySessions);
+  const [newMasterSessionLabel, setNewMasterSessionLabel] = useState('');
+  const [newMasterSessionStart, setNewMasterSessionStart] = useState('08:00');
+  const [newMasterSessionDeadline, setNewMasterSessionDeadline] = useState('12:00');
   useEffect(() => {
     setEditableSessions(dailySessions);
   }, [dailySessions]);
@@ -787,7 +790,7 @@ export function MasterView({
   };
 
   // ============================================================================
-  //DAILY SESSIONS & SCHEDULE CRUD HANDLERS
+  // DAILY SESSIONS & SCHEDULE CRUD HANDLERS
   // ============================================================================
   const handleSaveDailySessions = async (e: FormEvent) => {
     e.preventDefault();
@@ -797,12 +800,67 @@ export function MasterView({
       await onUpdateDailySessions(editableSessions);
       setFormMsg({
         type: 'ok',
-        text: 'Jam mulai & batas jam terlambat untuk 3 Sesi Harian (Siang, Sore, Malam) berhasil diperbarui.',
+        text: 'Konfigurasi jenis sesi, jam mulai & batas jam terlambat berhasil diperbarui.',
       });
     } catch {
       setFormMsg({
         type: 'err',
         text: 'Gagal menyimpan pengaturan batas jam sesi harian.',
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleAddMasterCustomSession = async () => {
+    const cleanLabel = newMasterSessionLabel.trim();
+    if (!cleanLabel) return;
+    const baseKey =
+      cleanLabel
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_|_$/g, '') || `sesi_${editableSessions.length + 1}`;
+    let uniqueKey = baseKey;
+    let counter = 2;
+    while (
+      editableSessions.some((s) => s.key === uniqueKey) ||
+      uniqueKey === 'kegiatan_lainnya'
+    ) {
+      uniqueKey = `${baseKey}_${counter}`;
+      counter++;
+    }
+    const newItem: DailySessionConfig = {
+      key: uniqueKey,
+      label: cleanLabel,
+      start_time: newMasterSessionStart || '08:00',
+      deadline_time: newMasterSessionDeadline || '12:00',
+      is_active: true,
+    };
+    const nextList = [...editableSessions, newItem];
+    setEditableSessions(nextList);
+    setNewMasterSessionLabel('');
+    setSubmitting(true);
+    try {
+      await onUpdateDailySessions(nextList);
+      setFormMsg({
+        type: 'ok',
+        text: `Jenis sesi baru "${cleanLabel}" (${newItem.start_time} – Batas ${newItem.deadline_time}) berhasil ditambahkan.`,
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDeleteMasterSession = async (targetKey: string) => {
+    if (editableSessions.length <= 1) return;
+    const nextList = editableSessions.filter((s) => s.key !== targetKey);
+    setEditableSessions(nextList);
+    setSubmitting(true);
+    try {
+      await onUpdateDailySessions(nextList);
+      setFormMsg({
+        type: 'ok',
+        text: 'Jenis sesi berhasil dihapus.',
       });
     } finally {
       setSubmitting(false);
@@ -2276,7 +2334,7 @@ export function MasterView({
       )}
 
       {/* =================================================================== */}
-      {/* TAB 4: 3 DAILY SESSIONS & SCHEDULES (DENGAN CRUD JADWAL)            */}
+      {/* TAB 4: KONTROL JENIS & JAM SESI HARIAN & SCHEDULES                  */}
       {/* =================================================================== */}
       {activeTab === 'schedules' && (
         <div className="space-y-6">
@@ -2288,13 +2346,13 @@ export function MasterView({
               <div>
                 <span className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-2.5 py-0.5 text-[10px] font-extrabold tracking-wider text-white uppercase">
                   <Clock className="h-3 w-3" />
-                  Aturan Jam Sesi &amp; Keterlambatan Penggunaan Harian
+                  Kontrol Sesi · Ubah &amp; Tambah Jenis dan Jam Sesi Harian
                 </span>
                 <h3 className="mt-1 text-base font-extrabold text-slate-900">
-                  Pengaturan Jam Mulai &amp; Batas Jam Terlambat — 3 Sesi Harian (Siang, Sore &amp; Malam)
+                  Pengaturan Jenis Sesi, Jam Mulai &amp; Batas Jam Terlambat ({editableSessions.length} Sesi)
                 </h3>
                 <p className="text-xs text-slate-600">
-                  Sistem menahan &amp; mengoreksi otomatis jika Guru Piket memilih sesi harian yang tidak sesuai jam sekarang, serta mencatat siswa <strong>Terlambat</strong> jika kembali melewati Batas Jam Telat.
+                  Ubah nama/jenis sesi, jam mulai, dan batas jam telat, atau tambahkan jenis sesi baru di bawah ini.
                 </p>
               </div>
               <button
@@ -2303,8 +2361,62 @@ export function MasterView({
                 className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-2.5 text-xs font-extrabold text-white shadow-sm transition-all hover:from-indigo-700 hover:to-blue-700 disabled:opacity-50"
               >
                 <Save className="h-4 w-4" />
-                Simpan Jam 3 Sesi
+                Simpan Perubahan Sesi
               </button>
+            </div>
+
+            {/* Baris Tambah Jenis & Jam Sesi Baru */}
+            <div className="border-b border-indigo-100 bg-indigo-50/40 px-5 py-4">
+              <p className="text-xs font-extrabold text-indigo-950 uppercase">
+                + Tambah Jenis &amp; Jam Sesi Baru
+              </p>
+              <div className="mt-2.5 grid grid-cols-1 gap-3 sm:grid-cols-12 sm:items-end">
+                <div className="sm:col-span-5">
+                  <label className="mb-1 block text-xs font-bold text-slate-700">
+                    Nama / Jenis Sesi Baru
+                  </label>
+                  <input
+                    type="text"
+                    value={newMasterSessionLabel}
+                    onChange={(e) => setNewMasterSessionLabel(e.target.value)}
+                    placeholder="Contoh: Sesi Pagi / Sesi Bimbel Malam"
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-900 outline-none focus:border-indigo-600"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="mb-1 block text-xs font-bold text-slate-700">
+                    Jam Mulai Sesi
+                  </label>
+                  <input
+                    type="time"
+                    value={newMasterSessionStart}
+                    onChange={(e) => setNewMasterSessionStart(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-xs font-bold text-slate-900 outline-none focus:border-indigo-600"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="mb-1 block text-xs font-bold text-rose-700">
+                    Batas Jam Telat
+                  </label>
+                  <input
+                    type="time"
+                    value={newMasterSessionDeadline}
+                    onChange={(e) => setNewMasterSessionDeadline(e.target.value)}
+                    className="w-full rounded-xl border border-rose-300 bg-rose-50/40 px-3 py-2 font-mono text-xs font-bold text-rose-900 outline-none focus:border-rose-600"
+                  />
+                </div>
+                <div className="sm:col-span-3">
+                  <button
+                    type="button"
+                    disabled={submitting || !newMasterSessionLabel.trim()}
+                    onClick={handleAddMasterCustomSession}
+                    className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl bg-indigo-700 px-3.5 py-2.5 text-xs font-extrabold text-white shadow-xs hover:bg-indigo-800 disabled:opacity-50"
+                  >
+                    <Plus className="h-4 w-4" />
+                    Tambah Jenis &amp; Jam Sesi
+                  </button>
+                </div>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-4 p-5 md:grid-cols-3">
@@ -2329,29 +2441,58 @@ export function MasterView({
                     key={sess.key}
                     className={`rounded-2xl border-2 p-4 transition-all ${cardStyle}`}
                   >
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2">
                       <span
                         className={`inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r px-3 py-1 text-xs font-extrabold text-white shadow-xs ${badgeGradient}`}
                       >
                         <SessionIcon className="h-3.5 w-3.5" />
                         {sess.label}
                       </span>
-                      <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs font-bold text-slate-700">
-                        <input
-                          type="checkbox"
-                          checked={sess.is_active}
-                          onChange={(e) => {
-                            const next = [...editableSessions];
-                            next[idx] = { ...sess, is_active: e.target.checked };
-                            setEditableSessions(next);
-                          }}
-                          className="h-4 w-4 rounded border-slate-300 text-indigo-600"
-                        />
-                        Aktif
-                      </label>
+                      <div className="flex items-center gap-2">
+                        <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs font-bold text-slate-700">
+                          <input
+                            type="checkbox"
+                            checked={sess.is_active}
+                            onChange={(e) => {
+                              const next = [...editableSessions];
+                              next[idx] = { ...sess, is_active: e.target.checked };
+                              setEditableSessions(next);
+                            }}
+                            className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                          />
+                          Aktif
+                        </label>
+                        {editableSessions.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteMasterSession(sess.key)}
+                            className="rounded-lg border border-rose-200 bg-white/80 p-1 text-rose-600 hover:bg-rose-50"
+                            title="Hapus sesi ini"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
                     </div>
 
-                    <div className="mt-4 grid grid-cols-2 gap-3">
+                    <div className="mt-3">
+                      <label className="mb-1 block text-[11px] font-bold text-slate-600">
+                        Nama / Jenis Sesi
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={sess.label}
+                        onChange={(e) => {
+                          const next = [...editableSessions];
+                          next[idx] = { ...sess, label: e.target.value };
+                          setEditableSessions(next);
+                        }}
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-extrabold text-slate-900 outline-none focus:border-indigo-600"
+                      />
+                    </div>
+
+                    <div className="mt-3 grid grid-cols-2 gap-3">
                       <div>
                         <label className="mb-1 block text-[11px] font-bold text-slate-600">
                           Jam Mulai Sesi
